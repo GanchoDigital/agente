@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  whatsapp-gpt:
+    build: .
+    container_name: whatsapp-gpt
+    restart: unless-stopped
+    ports:
+      - "3004:3004"
+    environment:
+      - OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      - EVOLUTION_API_URL=https://evo.ganchodigital.com.br
+      - EVOLUTION_API_KEY=your-api-key
+      - SUPABASE_URL=https://gonabnfgeknhswxecryb.supabase.co
+      - SUPABASE_KEY=your-supabase-key
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - whatsapp-net
+
+networks:
+  whatsapp-net:
+    driver: bridge 

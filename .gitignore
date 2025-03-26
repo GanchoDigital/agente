@@ -1,0 +1,33 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambiente virtual
+venv/
+env/
+ENV/
+
+# Arquivos de ambiente
+.env
+*.env
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Diretórios específicos do projeto
+node_modules/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Arquivos temporários
+*.tmp
+*.bak
+*.swp
+*~ 
