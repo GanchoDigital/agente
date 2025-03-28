@@ -29,7 +29,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Carrega variáveis de ambiente
-load_dotenv()
+try:
+    load_dotenv()
+except Exception as e:
+    logger.warning(f"Não foi possível carregar o arquivo .env: {str(e)}")
 
 # Configurações
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -37,6 +40,13 @@ EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://evo.ganchodigital.co
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+# Logs para debug
+logger.info(f"EVOLUTION_API_URL: {EVOLUTION_API_URL}")
+logger.info(f"OPENAI_API_KEY definida: {bool(OPENAI_API_KEY)}")
+logger.info(f"EVOLUTION_API_KEY definida: {bool(EVOLUTION_API_KEY)}")
+logger.info(f"SUPABASE_URL definida: {bool(SUPABASE_URL)}")
+logger.info(f"SUPABASE_KEY definida: {bool(SUPABASE_KEY)}")
 
 # Valida as credenciais
 if not OPENAI_API_KEY:
@@ -239,6 +249,7 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
     """
     try:
         # Busca o usuário responsável pelo assistente
+        logger.info(f"Verificando limite para assistente: {instance_name}")
         assistant_data = supabase.table('assistants').select(
             'user_id'
         ).eq('instance_name', instance_name).execute()
@@ -250,16 +261,42 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
         user_id = assistant_data.data[0]['user_id']
         logger.info(f"ID do usuário encontrado: {user_id}")
         
-        # Busca o plano do usuário - usando coluna 'id' em vez de 'user_id'
-        user_data = supabase.table('users').select(
-            'plan'
-        ).eq('id', user_id).execute()
-        
-        if not user_data.data or len(user_data.data) == 0:
-            logger.error(f"Usuário não encontrado com id: {user_id}")
-            return True  # Se não encontrar o usuário, permite continuar
-        
-        user_plan = user_data.data[0]['plan']
+        # Tenta obter a estrutura da tabela users primeiro
+        try:
+            # Lista todas as colunas da tabela users
+            logger.info("Verificando o nome correto da coluna na tabela users...")
+            
+            # Tentativa com uma abordagem diferente - consultar todos os campos
+            user_data = supabase.table('users').select('*').eq('uuid', user_id).execute()
+            if user_data.data and len(user_data.data) > 0:
+                logger.info(f"Colunas disponíveis na tabela users: {list(user_data.data[0].keys())}")
+                user_plan = user_data.data[0].get('plan')
+                if not user_plan:
+                    logger.warning(f"Campo 'plan' não encontrado no usuário. Dados disponíveis: {user_data.data[0]}")
+                    user_plan = 'starter'  # Plano padrão
+            else:
+                # Tenta com diferentes nomes possíveis de coluna
+                for possible_id_column in ['uuid', 'user_id', 'id', 'ID']:
+                    try:
+                        logger.info(f"Tentando usar coluna '{possible_id_column}' na tabela users")
+                        user_data = supabase.table('users').select('*').eq(possible_id_column, user_id).execute()
+                        if user_data.data and len(user_data.data) > 0:
+                            logger.info(f"Coluna '{possible_id_column}' funciona! Colunas disponíveis: {list(user_data.data[0].keys())}")
+                            user_plan = user_data.data[0].get('plan')
+                            if not user_plan:
+                                logger.warning(f"Campo 'plan' não encontrado. Dados disponíveis: {user_data.data[0]}")
+                                user_plan = 'starter'  # Plano padrão
+                            break
+                    except Exception as e:
+                        logger.warning(f"Falha ao tentar coluna '{possible_id_column}': {str(e)}")
+                else:
+                    # Se nenhuma coluna funcionar
+                    logger.error(f"Não foi possível encontrar o usuário com nenhum campo de ID. Usando plano 'starter'")
+                    user_plan = 'starter'  # Plano padrão
+        except Exception as e:
+            logger.error(f"Erro ao tentar verificar estrutura da tabela: {str(e)}")
+            # Usa plano starter como fallback
+            user_plan = 'starter'
         
         # Define limite baseado no plano
         plan_limits = {
@@ -269,6 +306,10 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
             'empresa': 10000
         }
         
+        # Se user_plan estiver definido como None, use o valor padrão
+        if not user_plan:
+            user_plan = 'starter'
+            
         contact_limit = plan_limits.get(user_plan.lower() if isinstance(user_plan, str) else 'starter', 100)
         
         # Calcula data de 30 dias atrás
@@ -276,6 +317,7 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
         
         # Conta contatos do usuário nos últimos 30 dias
         try:
+            # Tenta usar a coluna user_id que o assistente preencheu
             contacts_data = supabase.table('contacts').select(
                 'id'
             ).eq('user_id', user_id).gte(
@@ -334,160 +376,144 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                 )
                 
                 logger.info(f"Resposta da requisição: Status {response.status_code}")
-                if response.status_code != 200:
+                if response.status_code != 200 and response.status_code != 201:
                     logger.error(f"Erro ao enviar mensagem: {response.text}")
                     
             return True
         
-        # Padrão para identificar emojis
-        emoji_pattern = r'[\U0001F000-\U0001F9FF]|[\u2600-\u26FF\u2700-\u27BF]'
+        # NOVA ABORDAGEM: identificar e agrupar por tópicos numerados
         
-        # Substitui URLs por marcadores temporários para preservá-las durante a divisão
-        urls = []
-        def capture_url(match):
-            urls.append(match.group(0))
-            return f"[[URL{len(urls)-1}]]"
+        # Dividir o texto por tópicos numerados
+        # Regex para identificar um tópico numerado (ex: "1. Texto" ou "1. Texto\nOutro texto")
+        # Cada tópico termina quando começa o próximo número ou acaba o texto
+        topic_pattern = r'(\d+\.\s*[^\n\d]*(?:\n[^\n\d]+)*)'
         
-        # Captura URLs e substitui por marcadores
-        formatted_message = re.sub(r'(https?://[^\s]+)', capture_url, response_text)
+        # Encontrar todos os tópicos numerados
+        topics = re.findall(topic_pattern, response_text)
         
-        # Tenta dividir a mensagem em frases completas primeiro
-        sentences = re.split(r'(?<=[.!?])\s+', formatted_message)
-        
-        # Se houver muitas frases curtas, agrupa-as
-        merged_sentences = []
-        current_merge = ""
-        
-        for sentence in sentences:
-            # Se a frase atual + a próxima forem menores que 150 caracteres, as junta
-            if len(current_merge + " " + sentence) < 150:
-                if current_merge:
-                    current_merge += " " + sentence
-                else:
-                    current_merge = sentence
-            else:
-                # A adição desta frase tornaria o grupo grande demais, então finalizamos o grupo atual
-                if current_merge:
-                    merged_sentences.append(current_merge)
-                current_merge = sentence
-                
-        # Adiciona o último grupo se houver
-        if current_merge:
-            merged_sentences.append(current_merge)
+        # Verificar se temos tópicos ou se precisamos de outra abordagem
+        if topics and len(topics) > 1:
+            logger.info(f"Encontrados {len(topics)} tópicos numerados para envio")
             
-        # Se não conseguimos dividir bem por frases, dividimos usando o método anterior
-        if len(merged_sentences) <= 1:
-            # Divide o texto em palavras mantendo a pontuação
-            words = re.findall(r'\S+|\s+', formatted_message)
+            # Extrair cabeçalho (texto antes do primeiro tópico numerado)
+            header_match = re.match(r'(.*?)(?=\d+\.)', response_text, re.DOTALL)
+            header = header_match.group(1).strip() if header_match else None
             
-            # Divide a mensagem em partes
+            # Separar partes da mensagem
             parts = []
-            current_part = ""
-            last_was_punctuation_or_emoji = False  # Para controlar pontuação seguida de emoji
             
-            for i, word in enumerate(words):
-                current_part += word
-                
-                # Verifica se a palavra atual contém emoji
-                has_emoji = bool(re.search(emoji_pattern, word))
-                # Verifica se a próxima palavra (se existir) contém emoji
-                next_has_emoji = bool(re.search(emoji_pattern, words[i+1])) if i < len(words)-1 else False
-                
-                # Verifica se a palavra atual ou palavras anteriores formam um padrão de número seguido de ponto
-                is_numbered_list_item = False
-                if word.strip().endswith('.'):
-                    # Verificar se esta palavra é um número seguido de ponto
-                    if re.match(r'^\d+\.$', word.strip()):
-                        is_numbered_list_item = True
-                    # Verificar se a palavra anterior + esta palavra forma um "X.Y." (ex: "1.1.")
-                    elif i > 0 and re.match(r'^\.\d+\.$', word.strip()) and words[i-1].strip().endswith(r'\d'):
-                        is_numbered_list_item = True
-                
-                # Verifica se termina com ? ou !
-                ends_with_punct = (
-                    word.strip().endswith(('?', '!')) or 
-                    (word.strip().endswith('.') and not is_numbered_list_item)
-                )
-                
-                # Se a palavra tem pontuação e a próxima tem emoji, não quebra a mensagem
-                if ends_with_punct and next_has_emoji:
-                    last_was_punctuation_or_emoji = True
+            # Adicionar cabeçalho se existir
+            if header and len(header) > 0:
+                parts.append(header)
+            
+            # Agrupar tópicos que são curtos
+            current_group = ""
+            for topic in topics:
+                # Se o tópico for muito longo (mais de 250 caracteres), enviar separado
+                if len(topic) > 250:
+                    # Se já temos um grupo, envia primeiro
+                    if current_group:
+                        parts.append(current_group.strip())
+                        current_group = ""
+                    
+                    # Envia o tópico longo separadamente
+                    parts.append(topic.strip())
                     continue
-                    
-                # Condições para quebra de mensagem
-                should_break = (
-                    # Se tem emoji e a próxima palavra não tem emoji e não estamos continuando após uma pontuação
-                    (has_emoji and not next_has_emoji and not last_was_punctuation_or_emoji) or
-                    # Se termina com pontuação (exceto número seguido de ponto) e não tem emoji na próxima palavra
-                    (ends_with_punct and not next_has_emoji)
-                ) and len(current_part.strip()) >= 80  # Parte deve ter pelo menos 80 caracteres
                 
-                # Reseta o flag se esta palavra não tem emoji
-                if not has_emoji:
-                    last_was_punctuation_or_emoji = False
-                
-                if should_break and current_part.strip():
-                    # Reinsere as URLs
-                    with_urls = re.sub(r'\[\[URL(\d+)\]\]', lambda m: urls[int(m.group(1))], current_part)
-                    
-                    # Filtra asteriscos em vez de removê-los completamente
-                    # Converte **texto** para *texto*
-                    final_part = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', with_urls)
-                    
-                    parts.append(final_part.strip())
-                    current_part = ""
+                # Se tópico é curto e adicionar ao grupo atual mantém tamanho gerenciável
+                if len(current_group) + len(topic) < 300:
+                    # Adiciona uma quebra de linha simples entre os tópicos
+                    if current_group:
+                        current_group += "\n" + topic  # Modificado para usar \n em vez de concatenar diretamente
+                    else:
+                        current_group = topic
+                else:
+                    # O grupo ficaria muito grande, então finalizamos o atual
+                    if current_group:
+                        parts.append(current_group.strip())
+                    current_group = topic
             
-            # Adiciona a última parte se houver conteúdo
-            if current_part.strip():
-                # Reinsere as URLs
-                with_urls = re.sub(r'\[\[URL(\d+)\]\]', lambda m: urls[int(m.group(1))], current_part)
-                
-                # Filtra asteriscos em vez de removê-los completamente
-                # Converte **texto** para *texto*
-                final_part = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', with_urls)
-                
-                parts.append(final_part.strip())
+            # Adicionar o último grupo se houver
+            if current_group:
+                parts.append(current_group.strip())
+        else:
+            # Não encontramos tópicos numerados bem definidos
+            # Dividir por parágrafos ou blocos lógicos
+            paragraphs = response_text.split('\n\n')
             
-            # Se não tiver partes identificáveis, usa a mensagem original como uma única mensagem
-            if not parts:
-                parts = [response_text]
-            
-            # Novo: Verifica se temos muitas partes pequenas e tenta agrupá-las se necessário
-            if len(parts) > 2:
-                grouped_parts = []
+            # Se temos parágrafos bem definidos
+            if len(paragraphs) > 1:
+                parts = []
                 current_group = ""
                 
-                for part in parts:
-                    if len(current_group + " " + part) < 150:
-                        if current_group:
-                            current_group += " " + part
+                for paragraph in paragraphs:
+                    # Verifica se o parágrafo contém um tópico numerado
+                    contains_topic = bool(re.search(r'^\d+\.', paragraph.strip()))
+                    
+                    # Se for um tópico numerado e for curto, agrupa com o próximo
+                    if contains_topic and len(paragraph) < 50:
+                        # Se já temos um grupo, verificamos se o próximo tópico deve ser junto
+                        if current_group and not re.search(r'^\d+\.', current_group.strip()):
+                            parts.append(current_group.strip())
+                            current_group = paragraph
                         else:
-                            current_group = part
+                            # Continua agrupando
+                            if current_group:
+                                current_group += "\n" + paragraph  # Modificado para usar \n em vez de \n\n
+                            else:
+                                current_group = paragraph
                     else:
+                        # Se não for tópico ou for longo, envia separado
                         if current_group:
-                            grouped_parts.append(current_group)
-                        current_group = part
+                            parts.append(current_group.strip())
+                        current_group = paragraph
                 
-                # Adiciona o último grupo
+                # Adicionar o último grupo
                 if current_group:
-                    grouped_parts.append(current_group)
+                    parts.append(current_group.strip())
+            else:
+                # Texto sem estrutura clara de parágrafos ou tópicos
+                # Dividir por frases (pontuação)
+                sentences = re.split(r'(?<=[.!?])\s+', response_text)
                 
-                parts = grouped_parts
-        else:
-            # Usar as frases mescladas como partes
-            parts = merged_sentences
+                parts = []
+                current_part = ""
+                for sentence in sentences:
+                    # Se a adição desta frase mantiver o tamanho abaixo de 200 caracteres
+                    if len(current_part + sentence) < 200:
+                        current_part += sentence + " "
+                    else:
+                        # A parte ficaria muito grande, finalizamos a atual
+                        if current_part.strip():
+                            parts.append(current_part.strip())
+                        current_part = sentence + " "
+                
+                # Adicionar a última parte
+                if current_part.strip():
+                    parts.append(current_part.strip())
+        
+        # Formatar as partes finais
+        formatted_parts = []
+        for part in parts:
+            # Garantir que o texto tenha formatação markdown correta
+            # Converter **texto** para *texto* se ainda houver algum
+            formatted = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', part.strip())
+            # Corrigir números de lista que não têm espaço após o ponto
+            formatted = re.sub(r'(\d+\.)([^\s])', r'\1 \2', formatted)
+            formatted_parts.append(formatted)
+        
+        # Filtrar partes vazias
+        parts = [p for p in formatted_parts if p.strip()]
         
         # Log das partes para debug
         logger.info(f"Mensagem dividida em {len(parts)} partes:")
         for i, part in enumerate(parts):
             logger.info(f"Parte {i+1}: {part}")
         
-        # Envia cada parte como uma mensagem separada
+        # Enviar cada parte como uma mensagem separada
+        logger.info("Iniciando envio de mensagens...")
         async with httpx.AsyncClient() as client:
             for i, message in enumerate(parts):
-                # Filtra asteriscos duplos antes de enviar
-                message = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', message)
-                
                 logger.info(f"Enviando parte {i+1}/{len(parts)}: {message}")
                 
                 evolution_url = f"{server_url}/message/sendText/{instance_name}"
@@ -497,14 +523,12 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                     "apikey": apikey
                 }
                 
-                # Payload no formato correto
                 payload = {
                     "number": phone,
                     "text": message,
                     "delay": 1200
                 }
-
-                logger.info(f"Fazendo requisição para: {evolution_url} com payload: {payload}")
+                
                 response = await client.post(
                     evolution_url,
                     headers=headers,
@@ -512,18 +536,17 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                 )
                 
                 logger.info(f"Resposta da requisição {i+1}: Status {response.status_code}")
-                if response.status_code != 200:
+                if response.status_code != 200 and response.status_code != 201:
                     logger.error(f"Erro ao enviar mensagem: {response.text}")
                 
-                # Pausa maior entre mensagens para garantir a ordem
-                if i < len(parts) - 1:
-                    await asyncio.sleep(1.0)
-                
-            return True
-                
+                # Aguardar um tempo entre o envio de cada mensagem
+                await asyncio.sleep(1)
+            
+        logger.info("Todas as mensagens foram enviadas com sucesso")
+        return True
     except Exception as e:
-        logger.error(f"Erro ao enviar mensagens: {str(e)}")
-        traceback.print_exc()  # Adiciona rastreamento completo do erro
+        logger.error(f"Erro ao dividir e enviar mensagens: {str(e)}")
+        logger.error(traceback.format_exc())
         return False
 
 async def send_notification(
@@ -592,6 +615,55 @@ async def update_contact_stage(phone: str, stage: str, instance_name: str) -> bo
         logger.error(f"Erro ao atualizar estágio do contato: {str(e)}")
         # Adicionando log detalhado do erro
         logger.error(f"Detalhes do erro: phone={phone}, stage={stage}")
+        return False
+
+async def send_image(phone: str, instance_name: str, apikey: str, server_url: str, image_id: str) -> bool:
+    """Envia uma imagem para o usuário usando o ID da imagem do banco de dados."""
+    try:
+        # Busca a imagem no banco de dados
+        response = supabase.table('imagens').select('link').eq('image_id', image_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            logger.error(f"Imagem não encontrada com ID: {image_id}")
+            return False
+            
+        image_link = response.data[0]['link']
+        logger.info(f"Link da imagem encontrado: {image_link}")
+        
+        # Prepara a requisição para a Evolution API
+        evolution_url = f"{server_url}/message/sendMedia/{instance_name}"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "apikey": apikey
+        }
+        
+        payload = {
+            "number": phone,
+            "mediatype": "image",
+            "mimetype": "image/jpeg",
+            "media": image_link,
+            "fileName": "imagem.jpg",
+            "delay": 1200
+        }
+        
+        # Envia a requisição
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                evolution_url,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code != 200 and response.status_code != 201:
+                logger.error(f"Erro ao enviar imagem: {response.text}")
+                return False
+                
+        logger.info(f"Imagem enviada com sucesso para {phone}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao enviar imagem: {str(e)}")
         return False
 
 async def process_delayed_message(phone: str, instance_name: str, apikey: str, server_url: str):
@@ -714,6 +786,28 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             })
                             
                             logger.info(f"Função funil_de_vendas processada para {phone}: {stage}")
+                            
+                        elif function_name == 'enviar_imagem':
+                            image_id = function_args.get('imagem_id')
+                            
+                            # Envia a imagem
+                            success = await send_image(
+                                phone=phone,
+                                instance_name=instance_name,
+                                apikey=apikey,
+                                server_url=server_url,
+                                image_id=image_id
+                            )
+                            
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": json.dumps({
+                                    "success": success,
+                                    "message": f"Imagem enviada com sucesso" if success else "Falha ao enviar imagem"
+                                })
+                            })
+                            
+                            logger.info(f"Função enviar_imagem processada para {phone}: {image_id}")
                             
                         else:
                             # Para qualquer outra função, envia para o webhook
@@ -989,4 +1083,31 @@ async def download_audio(url: str, headers: Dict) -> str:
 if __name__ == "__main__":
     import uvicorn
     logger.info("Iniciando servidor...")
-    uvicorn.run("main:app", host="0.0.0.0", port=3004, reload=True) 
+    try:
+        # Verifica se todas as dependências necessárias estão presentes
+        logger.info("Verificando dependências necessárias...")
+        
+        # Tenta criar um cliente do Supabase
+        try:
+            supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            logger.info("Conexão com Supabase estabelecida com sucesso")
+        except Exception as e:
+            logger.error(f"⚠️ ERRO DE INICIALIZAÇÃO: Falha ao conectar ao Supabase: {str(e)}")
+            
+        # Tenta criar um cliente OpenAI
+        try:
+            openai_test = OpenAI(api_key=OPENAI_API_KEY)
+            logger.info("Cliente OpenAI inicializado com sucesso")
+        except Exception as e:
+            logger.error(f"⚠️ ERRO DE INICIALIZAÇÃO: Falha ao inicializar OpenAI: {str(e)}")
+        
+        # Inicia o servidor com desativação de recarregamento automático
+        logger.info("Iniciando servidor Uvicorn...")
+        uvicorn.run("main:app", host="0.0.0.0", port=3004, reload=False)
+    except Exception as e:
+        logger.error(f"⚠️ ERRO CRÍTICO: O servidor falhou ao iniciar: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        # Aguarda um pouco antes de sair para garantir que os logs sejam gravados
+        import time
+        time.sleep(5)
+        raise 
