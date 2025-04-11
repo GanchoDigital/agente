@@ -242,6 +242,76 @@ async def send_webhook_request(function_name: str, function_args: dict) -> bool:
         logger.error(f"Erro ao chamar webhook para função {function_name}: {str(e)}")
         return False
 
+async def send_notification(
+    target_number: str,
+    client_number: str,
+    client_name: str,
+    context: str,
+    instance_name: str,
+    apikey: str,
+    server_url: str
+):
+    """Envia notificação para um número específico sobre um cliente aguardando."""
+    try:
+        # Formata o número de destino
+        if target_number:
+            # Remove caracteres não numéricos
+            target_number = ''.join(filter(str.isdigit, target_number))
+            
+            # Verifica formato: DDD + 9 dígitos com 9 inicial -> remove o 9
+            if len(target_number) >= 3:  # Tem pelo menos DDD
+                ddd = target_number[:2]
+                numero = target_number[2:]
+                
+                if len(numero) == 9 and numero[0] == '9':
+                    numero = numero[1:]  # Remove o 9 inicial
+                    logger.info(f"Número após formatação: {ddd + numero}")
+                
+                target_number = ddd + numero
+                
+                # Adiciona código do país se não tiver
+                if not target_number.startswith('55'):
+                    target_number = '55' + target_number
+                    logger.info(f"Número após adicionar código do país: {target_number}")
+
+        notification_message = (
+            "Um cliente está aguardando o seu contato\n\n"
+            f"Nome: {client_name}\n"
+            f"Número: {client_number}\n"
+            f"Contexto: {context}"
+        )
+
+        evolution_url = f"{server_url}/message/sendText/{instance_name}"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "apikey": apikey
+        }
+        
+        # Simplificando o payload para usar o formato que funciona
+        payload = {
+            "number": target_number,
+            "text": notification_message,
+            "delay": 1200
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                evolution_url,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Erro ao enviar notificação: {response.text}")
+            
+        logger.info(f"Notificação enviada para {target_number}")
+        return response.status_code == 200
+
+    except Exception as e:
+        logger.error(f"Erro ao enviar notificação: {str(e)}")
+        return False
+
 async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
     """
     Verifica se o usuário atingiu o limite de contatos do seu plano.
@@ -549,24 +619,80 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
         logger.error(traceback.format_exc())
         return False
 
-async def send_notification(
-    target_number: str,
-    client_number: str,
+async def send_transfer_request(
+    phone: str,
     client_name: str,
-    context: str,
+    reason: str,
     instance_name: str,
     apikey: str,
     server_url: str
 ):
-    """Envia notificação para um número específico sobre um cliente aguardando."""
+    """Solicita transferência do atendimento para um humano."""
     try:
-        notification_message = (
-            "Um cliente está aguardando o seu contato\n\n"
-            f"Nome: {client_name}\n"
-            f"Número: {client_number}\n"
-            f"Contexto: {context}"
+        # Busca o usuário responsável pelo assistente
+        logger.info(f"Preparando transferência para humano. Instância: {instance_name}")
+        assistant_data = supabase.table('assistants').select(
+            'id, user_id'
+        ).eq('instance_name', instance_name).execute()
+        
+        if not assistant_data.data or len(assistant_data.data) == 0:
+            logger.error(f"Assistente não encontrado: {instance_name}")
+            return False
+        
+        user_id = assistant_data.data[0]['user_id']
+        assistant_id = assistant_data.data[0]['id']
+        
+        logger.info(f"ID do assistente encontrado: {assistant_id}")
+        
+        # Busca o número de transferência na tabela agent_configurations
+        transfer_config = supabase.table('agent_configurations').select(
+            'transfer_number'
+        ).eq('assistant_id', assistant_id).execute()
+        
+        if not transfer_config.data or len(transfer_config.data) == 0:
+            logger.error(f"Configuração de transferência não encontrada para assistente: {assistant_id}")
+            transfer_number = None
+        else:
+            transfer_number = transfer_config.data[0]['transfer_number']
+            logger.info(f"Número de transferência encontrado: {transfer_number}")
+            
+            # Formata o número conforme regra
+            if transfer_number:
+                # Remove caracteres não numéricos
+                transfer_number = ''.join(filter(str.isdigit, transfer_number))
+                
+                # Verifica formato: DDD + 9 dígitos com 9 inicial -> remove o 9
+                if len(transfer_number) >= 3:  # Tem pelo menos DDD
+                    ddd = transfer_number[:2]
+                    numero = transfer_number[2:]
+                    
+                    if len(numero) == 9 and numero[0] == '9':
+                        numero = numero[1:]  # Remove o 9 inicial
+                        logger.info(f"Número após formatação: {ddd + numero}")
+                    
+                    transfer_number = ddd + numero
+                    
+                    # Adiciona código do país se não tiver
+                    if not transfer_number.startswith('55'):
+                        transfer_number = '55' + transfer_number
+                        logger.info(f"Número após adicionar código do país: {transfer_number}")
+        
+        # Atualiza o status do contato para "cooldown"
+        try:
+            supabase.table('contacts').update({
+                'status': 'cooldown',
+                'transfer_reason': reason,
+                'cooldown_until': (datetime.utcnow() + timedelta(hours=24)).isoformat()
+            }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+            logger.info(f"Status do contato {phone} atualizado para 'cooldown'")
+        except Exception as e:
+            logger.error(f"Erro ao atualizar status do contato: {str(e)}")
+        
+        # Notifica o usuário sobre a solicitação
+        transfer_message = (
+            "Estou transferindo seu atendimento para um humano. Em breve alguém entrará em contato."
         )
-
+        
         evolution_url = f"{server_url}/message/sendText/{instance_name}"
         
         headers = {
@@ -574,13 +700,12 @@ async def send_notification(
             "apikey": apikey
         }
         
-        # Simplificando o payload para usar o formato que funciona
         payload = {
-            "number": target_number,
-            "text": notification_message,
+            "number": phone,
+            "text": transfer_message,
             "delay": 1200
         }
-
+        
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 evolution_url,
@@ -588,14 +713,27 @@ async def send_notification(
                 json=payload
             )
             
-            if response.status_code != 200:
-                logger.error(f"Erro ao enviar notificação: {response.text}")
-            
-        logger.info(f"Notificação enviada para {target_number}")
-        return response.status_code == 200
-
+            if response.status_code != 200 and response.status_code != 201:
+                logger.error(f"Erro ao enviar mensagem de transferência: {response.text}")
+                return False
+        
+        # Envia notificação para o número de transferência
+        if transfer_number:
+            await send_notification(
+                target_number=transfer_number,
+                client_number=phone,
+                client_name=client_name,
+                context=reason,
+                instance_name=instance_name,
+                apikey=apikey,
+                server_url=server_url
+            )
+        
+        logger.info(f"Solicitação de transferência processada para {phone}")
+        return True
+        
     except Exception as e:
-        logger.error(f"Erro ao enviar notificação: {str(e)}")
+        logger.error(f"Erro ao processar transferência: {str(e)}")
         return False
 
 async def update_contact_stage(phone: str, stage: str, instance_name: str) -> bool:
@@ -617,14 +755,14 @@ async def update_contact_stage(phone: str, stage: str, instance_name: str) -> bo
         logger.error(f"Detalhes do erro: phone={phone}, stage={stage}")
         return False
 
-async def send_image(phone: str, instance_name: str, apikey: str, server_url: str, image_id: str) -> bool:
-    """Envia uma imagem para o usuário usando o ID da imagem do banco de dados."""
+async def send_image(phone: str, instance_name: str, apikey: str, server_url: str, media_id: str) -> bool:
+    """Envia uma imagem para o usuário usando o ID da mídia do banco de dados."""
     try:
         # Busca a imagem no banco de dados
-        response = supabase.table('imagens').select('link').eq('image_id', image_id).execute()
+        response = supabase.table('media').select('link').eq('media_id', media_id).execute()
         
         if not response.data or len(response.data) == 0:
-            logger.error(f"Imagem não encontrada com ID: {image_id}")
+            logger.error(f"Imagem não encontrada com ID: {media_id}")
             return False
             
         image_link = response.data[0]['link']
@@ -666,6 +804,101 @@ async def send_image(phone: str, instance_name: str, apikey: str, server_url: st
         logger.error(f"Erro ao enviar imagem: {str(e)}")
         return False
 
+async def send_audio(phone: str, instance_name: str, apikey: str, server_url: str, media_id: str) -> bool:
+    """Envia um áudio para o usuário usando o ID da mídia do banco de dados."""
+    try:
+        # Busca o áudio no banco de dados
+        response = supabase.table('media').select('link').eq('media_id', media_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            logger.error(f"Áudio não encontrado com ID: {media_id}")
+            return False
+            
+        audio_link = response.data[0]['link']
+        logger.info(f"Link do áudio encontrado: {audio_link}")
+        
+        # Prepara a requisição para a Evolution API
+        evolution_url = f"{server_url}/message/sendWhatsAppAudio/{instance_name}"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "apikey": apikey
+        }
+        
+        payload = {
+            "number": phone,
+            "audio": audio_link,
+            "delay": 1200
+        }
+        
+        # Envia a requisição
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                evolution_url,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code != 200 and response.status_code != 201:
+                logger.error(f"Erro ao enviar áudio: {response.text}")
+                return False
+                
+        logger.info(f"Áudio enviado com sucesso para {phone}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao enviar áudio: {str(e)}")
+        return False
+
+async def send_video(phone: str, instance_name: str, apikey: str, server_url: str, media_id: str) -> bool:
+    """Envia um vídeo para o usuário usando o ID da mídia do banco de dados."""
+    try:
+        # Busca o vídeo no banco de dados
+        response = supabase.table('media').select('link').eq('media_id', media_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            logger.error(f"Vídeo não encontrado com ID: {media_id}")
+            return False
+            
+        video_link = response.data[0]['link']
+        logger.info(f"Link do vídeo encontrado: {video_link}")
+        
+        # Prepara a requisição para a Evolution API
+        evolution_url = f"{server_url}/message/sendMedia/{instance_name}"
+        
+        headers = {
+            "Content-Type": "application/json",
+            "apikey": apikey
+        }
+        
+        payload = {
+            "number": phone,
+            "mediatype": "video",
+            "mimetype": "video/mp4",
+            "media": video_link,
+            "fileName": "video.mp4",
+            "delay": 1200
+        }
+        
+        # Envia a requisição
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                evolution_url,
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code != 200 and response.status_code != 201:
+                logger.error(f"Erro ao enviar vídeo: {response.text}")
+                return False
+                
+        logger.info(f"Vídeo enviado com sucesso para {phone}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao enviar vídeo: {str(e)}")
+        return False
+
 async def process_delayed_message(phone: str, instance_name: str, apikey: str, server_url: str):
     # Define a chave única no início da função
     key = f"{phone}:{instance_name}"
@@ -691,8 +924,12 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
         # Processa a mensagem concatenada
         contact = await check_and_create_contact(phone, instance_name, "", False)
         
-        if not contact or contact['status'] != 'ativo':
-            logger.info(f"Contato {phone} não está ativo")
+        if not contact:
+            logger.info(f"Contato {phone} não encontrado")
+            return
+            
+        if contact['status'] in ['cooldown', 'pausado']:
+            logger.info(f"Contato {phone} está {contact['status']}")
             return
             
         # Usa a thread existente do contato
@@ -746,21 +983,19 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                     try:
                         function_args = json.loads(tool_call.function.arguments)
                         
-                        if function_name == 'notificar':
+                        if function_name == 'solicitar_transferencia':
                             # Obtém informações do contato
                             contact = await check_and_create_contact(phone, instance_name, "", False)
                             client_name = contact.get('name', 'Nome não disponível')
                             
-                            # Obtém o contexto da conversa (últimas mensagens)
-                            messages = openai_client.beta.threads.messages.list(thread_id=thread_id)
-                            context = messages.data[1].content[0].text.value if len(messages.data) > 1 else "Sem contexto disponível"
+                            # Obtém o motivo da transferência
+                            reason = function_args.get('motivo', 'Não especificado')
                             
-                            # Envia a notificação
-                            success = await send_notification(
-                                target_number=function_args.get('numero'),
-                                client_number=phone,
+                            # Solicita a transferência
+                            success = await send_transfer_request(
+                                phone=phone,
                                 client_name=client_name,
-                                context=context,
+                                reason=reason,
                                 instance_name=instance_name,
                                 apikey=apikey,
                                 server_url=server_url
@@ -768,8 +1003,13 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             
                             tool_outputs.append({
                                 "tool_call_id": tool_call.id,
-                                "output": json.dumps({"success": success})
+                                "output": json.dumps({
+                                    "success": success,
+                                    "message": "Transferência solicitada com sucesso" if success else "Falha ao solicitar transferência"
+                                })
                             })
+                            
+                            logger.info(f"Função solicitar_transferencia processada para {phone}: {reason}")
                             
                         elif function_name == 'funil_de_vendas':
                             stage = function_args.get('estagio')
@@ -788,7 +1028,7 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             logger.info(f"Função funil_de_vendas processada para {phone}: {stage}")
                             
                         elif function_name == 'enviar_imagem':
-                            image_id = function_args.get('imagem_id')
+                            media_id = function_args.get('media_id')
                             
                             # Envia a imagem
                             success = await send_image(
@@ -796,7 +1036,7 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                                 instance_name=instance_name,
                                 apikey=apikey,
                                 server_url=server_url,
-                                image_id=image_id
+                                media_id=media_id
                             )
                             
                             tool_outputs.append({
@@ -807,7 +1047,51 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                                 })
                             })
                             
-                            logger.info(f"Função enviar_imagem processada para {phone}: {image_id}")
+                            logger.info(f"Função enviar_imagem processada para {phone}: {media_id}")
+                            
+                        elif function_name == 'enviar_audio':
+                            media_id = function_args.get('media_id')
+                            
+                            # Envia o áudio
+                            success = await send_audio(
+                                phone=phone,
+                                instance_name=instance_name,
+                                apikey=apikey,
+                                server_url=server_url,
+                                media_id=media_id
+                            )
+                            
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": json.dumps({
+                                    "success": success,
+                                    "message": f"Áudio enviado com sucesso" if success else "Falha ao enviar áudio"
+                                })
+                            })
+                            
+                            logger.info(f"Função enviar_audio processada para {phone}: {media_id}")
+                            
+                        elif function_name == 'enviar_video':
+                            media_id = function_args.get('media_id')
+                            
+                            # Envia o vídeo
+                            success = await send_video(
+                                phone=phone,
+                                instance_name=instance_name,
+                                apikey=apikey,
+                                server_url=server_url,
+                                media_id=media_id
+                            )
+                            
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": json.dumps({
+                                    "success": success,
+                                    "message": f"Vídeo enviado com sucesso" if success else "Falha ao enviar vídeo"
+                                })
+                            })
+                            
+                            logger.info(f"Função enviar_video processada para {phone}: {media_id}")
                             
                         else:
                             # Para qualquer outra função, envia para o webhook
@@ -945,9 +1229,13 @@ async def webhook(data: WhatsAppWebhook):
 
         contact = await check_and_create_contact(phone, instance_name, push_name, from_me)
         
-        if not contact or contact['status'] != 'ativo':
-            logger.info(f"Mensagem descartada para {phone}. Status: {contact['status'] if contact else 'não encontrado'}")
-            return {"success": False, "message": "Contato não está ativo"}
+        if not contact:
+            logger.info(f"Mensagem descartada para {phone}. Motivo: Contato não encontrado")
+            return {"success": False, "message": "Contato não encontrado"}
+            
+        if contact['status'] in ['cooldown', 'pausado']:
+            logger.info(f"Mensagem descartada para {phone}. Status: {contact['status']}")
+            return {"success": False, "message": f"Contato {contact['status']}"}
 
         # Processa diferentes tipos de mensagem
         user_message = ""
