@@ -1215,12 +1215,21 @@ async def webhook(data: WhatsAppWebhook):
         logger.info(f"Processando mensagem de {phone} na instância {instance_name}")
         logger.info(f"Tipo de mensagem: {message_type}")
         logger.info(f"De mim: {from_me}")
+
+        # Primeiro, verifica o status atual do contato
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        current_status = contact_response.data[0]['status'] if contact_response.data else None
         
         # Se a mensagem é do usuário (fromMe = true)
         if from_me:
             logger.info(f"Mensagem enviada pelo usuário para {phone}")
             try:
-                # Atualiza o contato para cooldown por 24 horas
+                # Se o status atual é 'pausado', mantém pausado
+                if current_status == 'pausado':
+                    logger.info(f"Contato {phone} mantido como pausado")
+                    return {"success": True, "message": "Contato mantido como pausado"}
+                
+                # Caso contrário, atualiza para cooldown
                 cooldown_end = (datetime.utcnow() + timedelta(hours=24)).isoformat()
                 supabase.table('contacts').update({
                     'last_contact': datetime.utcnow().isoformat(),
@@ -1232,8 +1241,13 @@ async def webhook(data: WhatsAppWebhook):
                 logger.info(f"Contato {phone} colocado em cooldown por 24 horas")
                 return {"success": True, "message": "Contato em cooldown após mensagem do usuário"}
             except Exception as e:
-                logger.error(f"Erro ao atualizar status do contato para cooldown: {str(e)}")
+                logger.error(f"Erro ao atualizar status do contato: {str(e)}")
                 return {"success": False, "message": "Erro ao atualizar status do contato"}
+
+        # Se o contato está em cooldown ou pausado, não processa a mensagem
+        if current_status in ['cooldown', 'pausado']:
+            logger.info(f"Mensagem descartada para {phone}. Status: {current_status}")
+            return {"success": False, "message": f"Contato {current_status}"}
 
         # Verifica limite de contatos
         within_limit = await check_contact_limit(instance_name, phone)
