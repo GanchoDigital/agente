@@ -150,13 +150,16 @@ async def check_and_create_contact(phone: str, instance_name: str, push_name: st
                 'last_contact': datetime.utcnow().isoformat(),
                 'from_me': True,
                 'status': 'cooldown',
-                'cooldown_until': cooldown_end
+                'cooldown_until': cooldown_end,
+                'thread_id': contact.get('thread_id')  # Preserva o thread_id
             }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
             logger.info(f"Contato {phone} entrou em cooldown")
         else:
             supabase.table('contacts').update({
                 'last_contact': datetime.utcnow().isoformat(),
-                'name': push_name or contact['name']
+                'name': push_name or contact['name'],
+                'thread_id': contact.get('thread_id'),  # Preserva o thread_id
+                'status': 'ativo'  # Garantindo que seja 'ativo' em vez de 'active'
             }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
             logger.info(f"Contato {phone} atualizado")
         
@@ -417,9 +420,15 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
 async def send_whatsapp_messages(response_text: str, phone: str, instance_name: str, apikey: str, server_url: str):
     """Divide a mensagem do assistente em partes e envia como mensagens separadas."""
     try:
-        # Substituir asteriscos duplos por simples
-        # Converte "**texto**" para "*texto*"
+        # Substituir asteriscos duplos por simples e tratar quebras de linha
+        # Primeiro, normaliza as quebras de linha para \n
+        response_text = response_text.replace('\r\n', '\n').replace('\r', '\n')
+        
+        # Converte **texto** para *texto*
         response_text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', response_text)
+        
+        # Remove quebras de linha entre asteriscos mantendo o espaço
+        response_text = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', response_text)
         
         # Se a mensagem completa for curta (menos de 100 caracteres), envia como uma única mensagem
         if len(response_text.strip()) < 100:
@@ -479,6 +488,9 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
             # Agrupar tópicos que são curtos
             current_group = ""
             for topic in topics:
+                # Tratar asteriscos no tópico
+                topic = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', topic)
+                
                 # Se o tópico for muito longo (mais de 250 caracteres), enviar separado
                 if len(topic) > 250:
                     # Se já temos um grupo, envia primeiro
@@ -494,7 +506,7 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                 if len(current_group) + len(topic) < 300:
                     # Adiciona uma quebra de linha simples entre os tópicos
                     if current_group:
-                        current_group += "\n" + topic  # Modificado para usar \n em vez de concatenar diretamente
+                        current_group += "\n" + topic
                     else:
                         current_group = topic
                 else:
@@ -517,6 +529,9 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                 current_group = ""
                 
                 for paragraph in paragraphs:
+                    # Tratar asteriscos no parágrafo
+                    paragraph = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', paragraph)
+                    
                     # Verifica se o parágrafo contém um tópico numerado
                     contains_topic = bool(re.search(r'^\d+\.', paragraph.strip()))
                     
@@ -529,7 +544,7 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                         else:
                             # Continua agrupando
                             if current_group:
-                                current_group += "\n" + paragraph  # Modificado para usar \n em vez de \n\n
+                                current_group += "\n" + paragraph
                             else:
                                 current_group = paragraph
                     else:
@@ -549,6 +564,9 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
                 parts = []
                 current_part = ""
                 for sentence in sentences:
+                    # Tratar asteriscos na sentença
+                    sentence = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', sentence)
+                    
                     # Se a adição desta frase mantiver o tamanho abaixo de 200 caracteres
                     if len(current_part + sentence) < 200:
                         current_part += sentence + " "
@@ -570,6 +588,8 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
             formatted = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', part.strip())
             # Corrigir números de lista que não têm espaço após o ponto
             formatted = re.sub(r'(\d+\.)([^\s])', r'\1 \2', formatted)
+            # Tratar asteriscos e quebras de linha uma última vez
+            formatted = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', formatted)
             formatted_parts.append(formatted)
         
         # Filtrar partes vazias
@@ -1177,8 +1197,12 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
 @app.post("/webhook")
 async def webhook(data: WhatsAppWebhook):
     try:
+        logger.info("Nova requisição recebida no webhook")
+        logger.info(f"Dados recebidos: {data}")
+        
         # Verifica se é um evento de mensagem
         if data.event != "messages.upsert":
+            logger.info(f"Evento ignorado: {data.event}")
             return {"success": True, "message": "Evento ignorado"}
 
         # Extrai informações relevantes
@@ -1188,10 +1212,28 @@ async def webhook(data: WhatsAppWebhook):
         from_me = data.data.key.fromMe
         message_type = data.data.messageType
         
+        logger.info(f"Processando mensagem de {phone} na instância {instance_name}")
+        logger.info(f"Tipo de mensagem: {message_type}")
+        logger.info(f"De mim: {from_me}")
+        
+        # Se a mensagem é do usuário (fromMe = true)
         if from_me:
-            await check_and_create_contact(phone, instance_name, push_name, from_me)
-            logger.info(f"Mensagem descartada para {phone}. Motivo: Mensagem do usuário")
-            return {"success": False, "message": "Mensagem do usuário"}
+            logger.info(f"Mensagem enviada pelo usuário para {phone}")
+            try:
+                # Atualiza o contato para cooldown por 24 horas
+                cooldown_end = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+                supabase.table('contacts').update({
+                    'last_contact': datetime.utcnow().isoformat(),
+                    'status': 'cooldown',
+                    'cooldown_until': cooldown_end,
+                    'from_me': True
+                }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+                
+                logger.info(f"Contato {phone} colocado em cooldown por 24 horas")
+                return {"success": True, "message": "Contato em cooldown após mensagem do usuário"}
+            except Exception as e:
+                logger.error(f"Erro ao atualizar status do contato para cooldown: {str(e)}")
+                return {"success": False, "message": "Erro ao atualizar status do contato"}
 
         # Verifica limite de contatos
         within_limit = await check_contact_limit(instance_name, phone)
@@ -1210,7 +1252,6 @@ async def webhook(data: WhatsAppWebhook):
                 "apikey": data.apikey
             }
             
-            # Simplificando o payload para usar o formato que funciona
             payload = {
                 "number": phone,
                 "text": message,
