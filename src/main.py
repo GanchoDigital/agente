@@ -28,6 +28,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Função para adicionar logs com instância
+def log_with_instance(message: str, instance_name: str, level: str = "INFO"):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_message = f"[{timestamp}] [{instance_name}] {message}"
+    
+    # Escreve no arquivo de log
+    with open('bot.log', 'a', encoding='utf-8') as f:
+        f.write(f"{log_message}\n")
+    
+    # Também usa o logger padrão
+    if level == "INFO":
+        logger.info(log_message)
+    elif level == "ERROR":
+        logger.error(log_message)
+    elif level == "WARNING":
+        logger.warning(log_message)
+    elif level == "DEBUG":
+        logger.debug(log_message)
+
 # Carrega variáveis de ambiente
 try:
     load_dotenv()
@@ -420,8 +439,7 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
 async def send_whatsapp_messages(response_text: str, phone: str, instance_name: str, apikey: str, server_url: str):
     """Divide a mensagem do assistente em partes e envia como mensagens separadas."""
     try:
-        # Substituir asteriscos duplos por simples e tratar quebras de linha
-        # Primeiro, normaliza as quebras de linha para \n
+        # Normaliza as quebras de linha
         response_text = response_text.replace('\r\n', '\n').replace('\r', '\n')
         
         # Converte **texto** para *texto*
@@ -435,205 +453,151 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
             logger.info(f"Mensagem curta ({len(response_text.strip())} caracteres), enviando sem dividir")
             
             evolution_url = f"{server_url}/message/sendText/{instance_name}"
-            
-            headers = {
-                "Content-Type": "application/json",
-                "apikey": apikey
-            }
-            
-            payload = {
-                "number": phone,
-                "text": response_text.strip(),
-                "delay": 1200
-            }
+            headers = {"Content-Type": "application/json", "apikey": apikey}
+            payload = {"number": phone, "text": response_text.strip(), "delay": 1200}
             
             async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    evolution_url,
-                    headers=headers,
-                    json=payload
-                )
-                
+                response = await client.post(evolution_url, headers=headers, json=payload)
                 logger.info(f"Resposta da requisição: Status {response.status_code}")
                 if response.status_code != 200 and response.status_code != 201:
                     logger.error(f"Erro ao enviar mensagem: {response.text}")
-                    
             return True
+
+        # Divide o texto em blocos lógicos (parágrafos)
+        # Usa uma regex que preserva caracteres especiais e monetários
+        blocks = []
+        current_block = ""
         
-        # NOVA ABORDAGEM: identificar e agrupar por tópicos numerados
-        
-        # Dividir o texto por tópicos numerados
-        # Regex para identificar um tópico numerado (ex: "1. Texto" ou "1. Texto\nOutro texto")
-        # Cada tópico termina quando começa o próximo número ou acaba o texto
-        topic_pattern = r'(\d+\.\s*[^\n\d]*(?:\n[^\n\d]+)*)'
-        
-        # Encontrar todos os tópicos numerados
-        topics = re.findall(topic_pattern, response_text)
-        
-        # Verificar se temos tópicos ou se precisamos de outra abordagem
-        if topics and len(topics) > 1:
-            logger.info(f"Encontrados {len(topics)} tópicos numerados para envio")
-            
-            # Extrair cabeçalho (texto antes do primeiro tópico numerado)
-            header_match = re.match(r'(.*?)(?=\d+\.)', response_text, re.DOTALL)
-            header = header_match.group(1).strip() if header_match else None
-            
-            # Separar partes da mensagem
-            parts = []
-            
-            # Adicionar cabeçalho se existir
-            if header and len(header) > 0:
-                parts.append(header)
-            
-            # Agrupar tópicos que são curtos
-            current_group = ""
-            for topic in topics:
-                # Tratar asteriscos no tópico
-                topic = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', topic)
-                
-                # Se o tópico for muito longo (mais de 250 caracteres), enviar separado
-                if len(topic) > 250:
-                    # Se já temos um grupo, envia primeiro
-                    if current_group:
-                        parts.append(current_group.strip())
-                        current_group = ""
-                    
-                    # Envia o tópico longo separadamente
-                    parts.append(topic.strip())
-                    continue
-                
-                # Se tópico é curto e adicionar ao grupo atual mantém tamanho gerenciável
-                if len(current_group) + len(topic) < 300:
-                    # Adiciona uma quebra de linha simples entre os tópicos
-                    if current_group:
-                        current_group += "\n" + topic
-                    else:
-                        current_group = topic
-                else:
-                    # O grupo ficaria muito grande, então finalizamos o atual
-                    if current_group:
-                        parts.append(current_group.strip())
-                    current_group = topic
-            
-            # Adicionar o último grupo se houver
-            if current_group:
-                parts.append(current_group.strip())
-        else:
-            # Não encontramos tópicos numerados bem definidos
-            # Dividir por parágrafos ou blocos lógicos
-            paragraphs = response_text.split('\n\n')
-            
-            # Se temos parágrafos bem definidos
-            if len(paragraphs) > 1:
-                parts = []
-                current_group = ""
-                
-                for paragraph in paragraphs:
-                    # Tratar asteriscos no parágrafo
-                    paragraph = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', paragraph)
-                    
-                    # Verifica se o parágrafo contém um tópico numerado
-                    contains_topic = bool(re.search(r'^\d+\.', paragraph.strip()))
-                    
-                    # Se for um tópico numerado e for curto, agrupa com o próximo
-                    if contains_topic and len(paragraph) < 50:
-                        # Se já temos um grupo, verificamos se o próximo tópico deve ser junto
-                        if current_group and not re.search(r'^\d+\.', current_group.strip()):
-                            parts.append(current_group.strip())
-                            current_group = paragraph
-                        else:
-                            # Continua agrupando
-                            if current_group:
-                                current_group += "\n" + paragraph
-                            else:
-                                current_group = paragraph
-                    else:
-                        # Se não for tópico ou for longo, envia separado
-                        if current_group:
-                            parts.append(current_group.strip())
-                        current_group = paragraph
-                
-                # Adicionar o último grupo
-                if current_group:
-                    parts.append(current_group.strip())
+        for line in response_text.split('\n'):
+            line = line.strip()
+            if not line:  # Linha vazia indica quebra de bloco
+                if current_block:
+                    blocks.append(current_block.strip())
+                    current_block = ""
             else:
-                # Texto sem estrutura clara de parágrafos ou tópicos
-                # Dividir por frases (pontuação)
-                sentences = re.split(r'(?<=[.!?])\s+', response_text)
+                if current_block:
+                    current_block += "\n" + line
+                else:
+                    current_block = line
+        
+        # Adiciona o último bloco se existir
+        if current_block:
+            blocks.append(current_block.strip())
+        
+        # Função auxiliar para verificar se um bloco contém uma lista numerada
+        def contains_numbered_list(text):
+            return bool(re.search(r'^\d+\.', text.strip(), re.MULTILINE))
+        
+        # Função auxiliar para verificar se um texto é um cabeçalho de lista
+        def is_list_header(text):
+            # Inclui emojis e caracteres especiais na verificação
+            return bool(re.search(r'.*[:：][\s]*$', text.strip()))
+        
+        # Processa os blocos e mantém o contexto
+        processed_blocks = []
+        i = 0
+        while i < len(blocks):
+            current_block = blocks[i].strip()
+            
+            # Se o bloco atual é um cabeçalho e o próximo contém uma lista
+            if i + 1 < len(blocks) and is_list_header(current_block) and contains_numbered_list(blocks[i + 1]):
+                # Junta o cabeçalho com a lista
+                combined_block = current_block + "\n\n" + blocks[i + 1]
                 
-                parts = []
-                current_part = ""
-                for sentence in sentences:
-                    # Tratar asteriscos na sentença
-                    sentence = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', sentence)
-                    
-                    # Se a adição desta frase mantiver o tamanho abaixo de 200 caracteres
-                    if len(current_part + sentence) < 200:
-                        current_part += sentence + " "
+                # Procura por mais itens de lista nos blocos seguintes
+                next_index = i + 2
+                while next_index < len(blocks) and contains_numbered_list(blocks[next_index]):
+                    # Verifica se o próximo bloco é continuação de um item da lista
+                    if re.match(r'^\d+\.', blocks[next_index].strip()):
+                        combined_block += "\n" + blocks[next_index]
                     else:
-                        # A parte ficaria muito grande, finalizamos a atual
-                        if current_part.strip():
-                            parts.append(current_part.strip())
-                        current_part = sentence + " "
+                        # Se não começa com número, pode ser continuação do item anterior
+                        combined_block += " " + blocks[next_index]
+                    next_index += 1
                 
-                # Adicionar a última parte
-                if current_part.strip():
-                    parts.append(current_part.strip())
+                processed_blocks.append(combined_block)
+                i = next_index
+            
+            # Se o bloco atual contém uma lista numerada
+            elif contains_numbered_list(current_block):
+                combined_block = current_block
+                
+                # Procura por mais itens de lista ou continuações nos blocos seguintes
+                next_index = i + 1
+                while next_index < len(blocks):
+                    next_block = blocks[next_index].strip()
+                    # Se é um novo item numerado
+                    if re.match(r'^\d+\.', next_block):
+                        combined_block += "\n" + next_block
+                        next_index += 1
+                    # Se é continuação do item anterior (não começa com número)
+                    elif not re.match(r'^\d+\.', next_block) and not is_list_header(next_block):
+                        combined_block += " " + next_block
+                        next_index += 1
+                    else:
+                        break
+                
+                processed_blocks.append(combined_block)
+                i = next_index
+            
+            # Bloco normal (sem lista)
+            else:
+                processed_blocks.append(current_block)
+                i += 1
         
-        # Formatar as partes finais
-        formatted_parts = []
-        for part in parts:
-            # Garantir que o texto tenha formatação markdown correta
-            # Converter **texto** para *texto* se ainda houver algum
-            formatted = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', part.strip())
-            # Corrigir números de lista que não têm espaço após o ponto
-            formatted = re.sub(r'(\d+\.)([^\s])', r'\1 \2', formatted)
-            # Tratar asteriscos e quebras de linha uma última vez
-            formatted = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', formatted)
-            formatted_parts.append(formatted)
+        # Função para limpar e formatar o texto final
+        def format_block(text):
+            # Remove múltiplas quebras de linha
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            
+            # Garante espaço após números de lista, preservando caracteres especiais
+            text = re.sub(r'(\d+\.)([^\s])', r'\1 \2', text)
+            
+            # Preserva símbolos monetários e caracteres especiais
+            text = re.sub(r'(R?\$)\s*(\d+)', r'\1\2', text)
+            
+            # Remove espaços extras no início/fim das linhas mantendo a formatação interna
+            lines = []
+            for line in text.split('\n'):
+                if re.match(r'^\d+\.', line.strip()):  # Se é item de lista
+                    lines.append(line.strip())
+                else:
+                    lines.append(line.strip())
+            
+            return '\n'.join(lines)
         
-        # Filtrar partes vazias
-        parts = [p for p in formatted_parts if p.strip()]
+        # Formata os blocos processados
+        formatted_blocks = [format_block(block) for block in processed_blocks]
         
-        # Log das partes para debug
-        logger.info(f"Mensagem dividida em {len(parts)} partes:")
-        for i, part in enumerate(parts):
-            logger.info(f"Parte {i+1}: {part}")
+        # Remove blocos vazios
+        formatted_blocks = [block for block in formatted_blocks if block.strip()]
         
-        # Enviar cada parte como uma mensagem separada
-        logger.info("Iniciando envio de mensagens...")
+        # Log para debug
+        logger.info(f"Mensagem dividida em {len(formatted_blocks)} blocos:")
+        for i, block in enumerate(formatted_blocks):
+            logger.info(f"Bloco {i+1}:\n{block}")
+        
+        # Envia os blocos
         async with httpx.AsyncClient() as client:
-            for i, message in enumerate(parts):
-                logger.info(f"Enviando parte {i+1}/{len(parts)}: {message}")
+            for i, message in enumerate(formatted_blocks):
+                logger.info(f"Enviando bloco {i+1}/{len(formatted_blocks)}")
                 
                 evolution_url = f"{server_url}/message/sendText/{instance_name}"
+                headers = {"Content-Type": "application/json", "apikey": apikey}
+                payload = {"number": phone, "text": message, "delay": 1200}
                 
-                headers = {
-                    "Content-Type": "application/json",
-                    "apikey": apikey
-                }
-                
-                payload = {
-                    "number": phone,
-                    "text": message,
-                    "delay": 1200
-                }
-                
-                response = await client.post(
-                    evolution_url,
-                    headers=headers,
-                    json=payload
-                )
-                
+                response = await client.post(evolution_url, headers=headers, json=payload)
                 logger.info(f"Resposta da requisição {i+1}: Status {response.status_code}")
+                
                 if response.status_code != 200 and response.status_code != 201:
                     logger.error(f"Erro ao enviar mensagem: {response.text}")
                 
-                # Aguardar um tempo entre o envio de cada mensagem
+                # Pequena pausa entre mensagens
                 await asyncio.sleep(1)
-            
+        
         logger.info("Todas as mensagens foram enviadas com sucesso")
         return True
+        
     except Exception as e:
         logger.error(f"Erro ao dividir e enviar mensagens: {str(e)}")
         logger.error(traceback.format_exc())
@@ -1197,12 +1161,12 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
 @app.post("/webhook")
 async def webhook(data: WhatsAppWebhook):
     try:
-        logger.info("Nova requisição recebida no webhook")
-        logger.info(f"Dados recebidos: {data}")
+        log_with_instance("Nova requisição recebida no webhook", data.instance)
+        log_with_instance(f"Dados recebidos: {data}", data.instance)
         
         # Verifica se é um evento de mensagem
         if data.event != "messages.upsert":
-            logger.info(f"Evento ignorado: {data.event}")
+            log_with_instance(f"Evento ignorado: {data.event}", data.instance)
             return {"success": True, "message": "Evento ignorado"}
 
         # Extrai informações relevantes
@@ -1212,21 +1176,24 @@ async def webhook(data: WhatsAppWebhook):
         from_me = data.data.key.fromMe
         message_type = data.data.messageType
         
-        logger.info(f"Processando mensagem de {phone} na instância {instance_name}")
-        logger.info(f"Tipo de mensagem: {message_type}")
-        logger.info(f"De mim: {from_me}")
+        log_with_instance(f"Processando mensagem de {phone}", instance_name)
+        log_with_instance(f"Tipo de mensagem: {message_type}", instance_name)
+        log_with_instance(f"De mim: {from_me}", instance_name)
 
         # Primeiro, verifica o status atual do contato
         contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
-        current_status = contact_response.data[0]['status'] if contact_response.data else None
+        contact = contact_response.data[0] if contact_response.data else None
+        current_status = contact['status'] if contact else None
         
+        log_with_instance(f"Status atual do contato {phone}: {current_status}", instance_name)
+
         # Se a mensagem é do usuário (fromMe = true)
         if from_me:
-            logger.info(f"Mensagem enviada pelo usuário para {phone}")
+            log_with_instance(f"Mensagem enviada pelo usuário para {phone}", instance_name)
             try:
                 # Se o status atual é 'pausado', mantém pausado
                 if current_status == 'pausado':
-                    logger.info(f"Contato {phone} mantido como pausado")
+                    log_with_instance(f"Contato {phone} mantido como pausado", instance_name)
                     return {"success": True, "message": "Contato mantido como pausado"}
                 
                 # Caso contrário, atualiza para cooldown
@@ -1238,15 +1205,22 @@ async def webhook(data: WhatsAppWebhook):
                     'from_me': True
                 }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
                 
-                logger.info(f"Contato {phone} colocado em cooldown por 24 horas")
+                log_with_instance(f"Contato {phone} colocado em cooldown por 24 horas", instance_name)
                 return {"success": True, "message": "Contato em cooldown após mensagem do usuário"}
             except Exception as e:
-                logger.error(f"Erro ao atualizar status do contato: {str(e)}")
+                log_with_instance(f"Erro ao atualizar status do contato: {str(e)}", instance_name, "ERROR")
                 return {"success": False, "message": "Erro ao atualizar status do contato"}
+
+        # Verifica novamente o status após qualquer atualização
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact = contact_response.data[0] if contact_response.data else None
+        current_status = contact['status'] if contact else None
+        
+        log_with_instance(f"Status verificado novamente para {phone}: {current_status}", instance_name)
 
         # Se o contato está em cooldown ou pausado, não processa a mensagem
         if current_status in ['cooldown', 'pausado']:
-            logger.info(f"Mensagem descartada para {phone}. Status: {current_status}")
+            log_with_instance(f"Mensagem descartada para {phone}. Status: {current_status}", instance_name)
             return {"success": False, "message": f"Contato {current_status}"}
 
         # Verifica limite de contatos
@@ -1282,15 +1256,14 @@ async def webhook(data: WhatsAppWebhook):
             logger.warning(f"Limite de contatos excedido para instância {instance_name}")
             return {"status": "error", "message": "Contact limit exceeded"}
 
-        contact = await check_and_create_contact(phone, instance_name, push_name, from_me)
+        # Verifica o status uma última vez antes de processar a mensagem
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact = contact_response.data[0] if contact_response.data else None
+        current_status = contact['status'] if contact else None
         
-        if not contact:
-            logger.info(f"Mensagem descartada para {phone}. Motivo: Contato não encontrado")
-            return {"success": False, "message": "Contato não encontrado"}
-            
-        if contact['status'] in ['cooldown', 'pausado']:
-            logger.info(f"Mensagem descartada para {phone}. Status: {contact['status']}")
-            return {"success": False, "message": f"Contato {contact['status']}"}
+        if current_status in ['cooldown', 'pausado']:
+            logger.info(f"Mensagem descartada para {phone}. Status final: {current_status}")
+            return {"success": False, "message": f"Contato {current_status}"}
 
         # Processa diferentes tipos de mensagem
         user_message = ""
@@ -1363,17 +1336,26 @@ async def webhook(data: WhatsAppWebhook):
         if not user_message:
             return {"success": False, "message": "Mensagem vazia"}
 
+        # Verifica o status uma última vez antes de adicionar à fila
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact = contact_response.data[0] if contact_response.data else None
+        current_status = contact['status'] if contact else None
+        
+        if current_status in ['cooldown', 'pausado']:
+            logger.info(f"Mensagem descartada para {phone}. Status final antes da fila: {current_status}")
+            return {"success": False, "message": f"Contato {current_status}"}
+
         # Adiciona a mensagem à lista de mensagens pendentes
         key = f"{phone}:{instance_name}"
         if key not in pending_messages:
             pending_messages[key] = []
         
         pending_messages[key].append(user_message)
-        logger.info(f"Mensagem adicionada à fila para {phone}. Total: {len(pending_messages[key])}")
+        log_with_instance(f"Mensagem adicionada à fila para {phone}. Total: {len(pending_messages[key])}", instance_name)
         
         # Se já existe uma tarefa pendente para este contato, não cria outra
         if key in pending_tasks and not pending_tasks[key].done():
-            logger.info(f"Já existe uma tarefa pendente para {key}")
+            log_with_instance(f"Já existe uma tarefa pendente para {key}", instance_name)
             return {"success": True, "message": "Mensagem adicionada à fila existente"}
             
         # Cria uma nova tarefa para processar após 5 segundos
@@ -1381,12 +1363,12 @@ async def webhook(data: WhatsAppWebhook):
             process_delayed_message(phone, instance_name, data.apikey, data.server_url)
         )
         pending_tasks[key] = task
-        logger.info(f"Nova tarefa de processamento criada para {key}")
+        log_with_instance(f"Nova tarefa de processamento criada para {key}", instance_name)
 
         return {"success": True, "message": "Mensagem adicionada à fila"}
 
     except Exception as e:
-        logger.error(f"Erro no processamento: {str(e)}")
+        log_with_instance(f"Erro no processamento: {str(e)}", data.instance, "ERROR")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
