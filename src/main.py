@@ -439,8 +439,14 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
 async def send_whatsapp_messages(response_text: str, phone: str, instance_name: str, apikey: str, server_url: str):
     """Divide a mensagem do assistente em partes e envia como mensagens separadas."""
     try:
+        # Remove os separadores "---"
+        response_text = re.sub(r'\s*---\s*', '\n', response_text)
+        
         # Normaliza as quebras de linha
         response_text = response_text.replace('\r\n', '\n').replace('\r', '\n')
+        
+        # Adiciona quebra de linha após ! e ? apenas se não for seguido por espaço
+        response_text = re.sub(r'([!?])(?!\s)(?!\n)', r'\1\n', response_text)
         
         # Converte **texto** para *texto*
         response_text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', response_text)
@@ -448,143 +454,68 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
         # Remove quebras de linha entre asteriscos mantendo o espaço
         response_text = re.sub(r'\*\s*\n\s*([^*\n]+)\s*\n\s*\*', r'* \1 *', response_text)
         
-        # Se a mensagem completa for curta (menos de 100 caracteres), envia como uma única mensagem
-        if len(response_text.strip()) < 100:
-            logger.info(f"Mensagem curta ({len(response_text.strip())} caracteres), enviando sem dividir")
-            
-            evolution_url = f"{server_url}/message/sendText/{instance_name}"
-            headers = {"Content-Type": "application/json", "apikey": apikey}
-            payload = {"number": phone, "text": response_text.strip(), "delay": 1200}
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(evolution_url, headers=headers, json=payload)
-                logger.info(f"Resposta da requisição: Status {response.status_code}")
-                if response.status_code != 200 and response.status_code != 201:
-                    logger.error(f"Erro ao enviar mensagem: {response.text}")
-            return True
-
-        # Divide o texto em blocos lógicos (parágrafos)
-        # Usa uma regex que preserva caracteres especiais e monetários
+        # Remove quebras de linha duplicadas
+        response_text = re.sub(r'\n\s*\n', '\n', response_text)
+        
+        # Divide o texto em blocos lógicos
         blocks = []
         current_block = ""
+        lines = response_text.split('\n')
+        i = 0
         
-        for line in response_text.split('\n'):
-            line = line.strip()
-            if not line:  # Linha vazia indica quebra de bloco
-                if current_block:
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Se é um item numerado
+            if re.match(r'^\d+\.', line):
+                # Começa um novo bloco se necessário
+                if current_block and not re.match(r'^\d+\.', current_block.split('\n')[0]):
                     blocks.append(current_block.strip())
                     current_block = ""
-            else:
+                
+                # Adiciona o item numerado
                 if current_block:
-                    current_block += "\n" + line
-                else:
+                    current_block += "\n"
+                current_block += line
+                
+                # Olha à frente para ver se há continuação do item
+                j = i + 1
+                while j < len(lines) and (not re.match(r'^\d+\.', lines[j].strip()) and lines[j].strip()):
+                    current_block += " " + lines[j].strip()
+                    j += 1
+                i = j
+            else:
+                # Para texto normal, verifica o tamanho
+                if len(current_block + "\n" + line) > 150 and current_block:
+                    blocks.append(current_block.strip())
                     current_block = line
+                else:
+                    if current_block and line:
+                        current_block += "\n" + line
+                    elif line:
+                        current_block = line
+                i += 1
         
-        # Adiciona o último bloco se existir
+        # Adiciona o último bloco
         if current_block:
             blocks.append(current_block.strip())
         
-        # Função auxiliar para verificar se um bloco contém uma lista numerada
-        def contains_numbered_list(text):
-            return bool(re.search(r'^\d+\.', text.strip(), re.MULTILINE))
-        
-        # Função auxiliar para verificar se um texto é um cabeçalho de lista
-        def is_list_header(text):
-            # Inclui emojis e caracteres especiais na verificação
-            return bool(re.search(r'.*[:：][\s]*$', text.strip()))
-        
-        # Processa os blocos e mantém o contexto
-        processed_blocks = []
-        i = 0
-        while i < len(blocks):
-            current_block = blocks[i].strip()
-            
-            # Se o bloco atual é um cabeçalho e o próximo contém uma lista
-            if i + 1 < len(blocks) and is_list_header(current_block) and contains_numbered_list(blocks[i + 1]):
-                # Junta o cabeçalho com a lista
-                combined_block = current_block + "\n\n" + blocks[i + 1]
-                
-                # Procura por mais itens de lista nos blocos seguintes
-                next_index = i + 2
-                while next_index < len(blocks) and contains_numbered_list(blocks[next_index]):
-                    # Verifica se o próximo bloco é continuação de um item da lista
-                    if re.match(r'^\d+\.', blocks[next_index].strip()):
-                        combined_block += "\n" + blocks[next_index]
-                    else:
-                        # Se não começa com número, pode ser continuação do item anterior
-                        combined_block += " " + blocks[next_index]
-                    next_index += 1
-                
-                processed_blocks.append(combined_block)
-                i = next_index
-            
-            # Se o bloco atual contém uma lista numerada
-            elif contains_numbered_list(current_block):
-                combined_block = current_block
-                
-                # Procura por mais itens de lista ou continuações nos blocos seguintes
-                next_index = i + 1
-                while next_index < len(blocks):
-                    next_block = blocks[next_index].strip()
-                    # Se é um novo item numerado
-                    if re.match(r'^\d+\.', next_block):
-                        combined_block += "\n" + next_block
-                        next_index += 1
-                    # Se é continuação do item anterior (não começa com número)
-                    elif not re.match(r'^\d+\.', next_block) and not is_list_header(next_block):
-                        combined_block += " " + next_block
-                        next_index += 1
-                    else:
-                        break
-                
-                processed_blocks.append(combined_block)
-                i = next_index
-            
-            # Bloco normal (sem lista)
-            else:
-                processed_blocks.append(current_block)
-                i += 1
-        
-        # Função para limpar e formatar o texto final
-        def format_block(text):
-            # Remove múltiplas quebras de linha
-            text = re.sub(r'\n{3,}', '\n\n', text)
-            
-            # Garante espaço após números de lista, preservando caracteres especiais
-            text = re.sub(r'(\d+\.)([^\s])', r'\1 \2', text)
-            
-            # Preserva símbolos monetários e caracteres especiais
-            text = re.sub(r'(R?\$)\s*(\d+)', r'\1\2', text)
-            
-            # Remove espaços extras no início/fim das linhas mantendo a formatação interna
-            lines = []
-            for line in text.split('\n'):
-                if re.match(r'^\d+\.', line.strip()):  # Se é item de lista
-                    lines.append(line.strip())
-                else:
-                    lines.append(line.strip())
-            
-            return '\n'.join(lines)
-        
-        # Formata os blocos processados
-        formatted_blocks = [format_block(block) for block in processed_blocks]
-        
-        # Remove blocos vazios
-        formatted_blocks = [block for block in formatted_blocks if block.strip()]
+        # Remove blocos vazios e garante quebras de linha após ! e ? (exceto se seguido por espaço)
+        blocks = [re.sub(r'([!?])(?!\s)(?!\n)(?!$)', r'\1\n', b.strip()) for b in blocks if b.strip()]
         
         # Log para debug
-        logger.info(f"Mensagem dividida em {len(formatted_blocks)} blocos:")
-        for i, block in enumerate(formatted_blocks):
-            logger.info(f"Bloco {i+1}:\n{block}")
+        logger.info(f"Mensagem dividida em {len(blocks)} partes:")
+        for i, block in enumerate(blocks):
+            logger.info(f"Parte {i+1}: {block[:50]}...")
         
-        # Envia os blocos
+        # Envia as mensagens
         async with httpx.AsyncClient() as client:
-            for i, message in enumerate(formatted_blocks):
-                logger.info(f"Enviando bloco {i+1}/{len(formatted_blocks)}")
+            for i, message in enumerate(blocks):
+                logger.info(f"Enviando parte {i+1}/{len(blocks)}")
                 
                 evolution_url = f"{server_url}/message/sendText/{instance_name}"
                 headers = {"Content-Type": "application/json", "apikey": apikey}
-                payload = {"number": phone, "text": message, "delay": 1200}
+                payload = {"number": phone, "text": message.strip(), "delay": 1200}
                 
                 response = await client.post(evolution_url, headers=headers, json=payload)
                 logger.info(f"Resposta da requisição {i+1}: Status {response.status_code}")
