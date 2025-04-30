@@ -28,10 +28,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Função para adicionar logs com instância
-def log_with_instance(message: str, instance_name: str, level: str = "INFO"):
+# Função para adicionar logs
+def log_with_instance(message: str, agent_id: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    log_message = f"[{timestamp}] [{instance_name}] {message}"
+    log_message = f"[{timestamp}] [{agent_id}] {message}"
     
     # Escreve no arquivo de log
     with open('bot.log', 'a', encoding='utf-8') as f:
@@ -55,23 +55,21 @@ except Exception as e:
 
 # Configurações
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "https://evo.ganchodigital.com.br")
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+QUEPASA_API_URL = os.getenv("QUEPASA_API_URL", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 # Logs para debug
-logger.info(f"EVOLUTION_API_URL: {EVOLUTION_API_URL}")
+logger.info(f"QUEPASA_API_URL: {QUEPASA_API_URL}")
 logger.info(f"OPENAI_API_KEY definida: {bool(OPENAI_API_KEY)}")
-logger.info(f"EVOLUTION_API_KEY definida: {bool(EVOLUTION_API_KEY)}")
 logger.info(f"SUPABASE_URL definida: {bool(SUPABASE_URL)}")
 logger.info(f"SUPABASE_KEY definida: {bool(SUPABASE_KEY)}")
 
 # Valida as credenciais
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY não definida no ambiente")
-if not EVOLUTION_API_KEY:
-    logger.error("EVOLUTION_API_KEY não definida no ambiente")
+if not QUEPASA_API_URL:
+    logger.error("QUEPASA_API_URL não definida no ambiente")
 if not SUPABASE_URL or not SUPABASE_KEY:
     logger.error("SUPABASE_URL ou SUPABASE_KEY não definidas no ambiente")
 
@@ -122,26 +120,49 @@ class MessageData(BaseModel):
     message: Message
     messageType: str
     messageTimestamp: int
-    instanceId: str
+    agent_id: str  # Alterado de instanceId para agent_id
     source: str
 
 class WhatsAppWebhook(BaseModel):
     event: str
-    instance: str
+    agent_id: str  # Alterado de instance para agent_id
     data: MessageData
     destination: str
     date_time: str
     sender: str
     server_url: str
-    apikey: str
+    token: str  # Alterado de apikey para token
 
-async def check_and_create_contact(phone: str, instance_name: str, push_name: str, from_me: bool) -> Optional[Dict]:
+# Classes para o novo formato do webhook Quepasa
+class ChatInfo(BaseModel):
+    id: str
+    title: Optional[str] = None
+
+class Attachment(BaseModel):
+    mime: Optional[str] = None
+    filelength: Optional[int] = None
+    seconds: Optional[int] = None
+
+class QuepasaMessage(BaseModel):
+    id: str
+    timestamp: str
+    type: str
+    chat: ChatInfo
+    text: Optional[str] = None
+    attachment: Optional[Attachment] = None
+    fromme: Any  # Pode ser string "false"/"true" ou booleano
+    frominternal: Any  # Pode ser string "false"/"true" ou booleano
+
+class QuepasaWebhook(BaseModel):
+    body: QuepasaMessage
+
+async def check_and_create_contact(phone: str, quepasa_wid: str, push_name: str, from_me: bool) -> Optional[Dict]:
     try:
         # Limpa o número do telefone (remove @s.whatsapp.net)
         phone = phone.split('@')[0]
         
-        # Busca o contato
-        response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        # Busca o contato - Usando nome real da coluna 'x-quepasa-wid'
+        response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
         
         if not response.data:
             # Se não existe, cria um novo contato
@@ -150,7 +171,7 @@ async def check_and_create_contact(phone: str, instance_name: str, push_name: st
                 'name': push_name or f'User {phone}',
                 'whatsapp': phone,
                 'status': 'ativo',
-                'instance_name': instance_name,
+                'x-quepasa-wid': quepasa_wid,
                 'last_contact': datetime.utcnow().isoformat(),
                 'thread_id': thread.id,
                 'followup': False,
@@ -171,7 +192,7 @@ async def check_and_create_contact(phone: str, instance_name: str, push_name: st
                 'status': 'cooldown',
                 'cooldown_until': cooldown_end,
                 'thread_id': contact.get('thread_id')  # Preserva o thread_id
-            }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+            }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
             logger.info(f"Contato {phone} entrou em cooldown")
         else:
             supabase.table('contacts').update({
@@ -179,7 +200,7 @@ async def check_and_create_contact(phone: str, instance_name: str, push_name: st
                 'name': push_name or contact['name'],
                 'thread_id': contact.get('thread_id'),  # Preserva o thread_id
                 'status': 'ativo'  # Garantindo que seja 'ativo' em vez de 'active'
-            }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+            }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
             logger.info(f"Contato {phone} atualizado")
         
         return contact
@@ -269,9 +290,8 @@ async def send_notification(
     client_number: str,
     client_name: str,
     context: str,
-    instance_name: str,
-    apikey: str,
-    server_url: str
+    agent_id: str,
+    token: str
 ):
     """Envia notificação para um número específico sobre um cliente aguardando."""
     try:
@@ -303,51 +323,37 @@ async def send_notification(
             f"Contexto: {context}"
         )
 
-        evolution_url = f"{server_url}/message/sendText/{instance_name}"
-        
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": apikey
-        }
-        
-        # Simplificando o payload para usar o formato que funciona
-        payload = {
-            "number": target_number,
-            "text": notification_message,
-            "delay": 1200
-        }
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                evolution_url,
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Erro ao enviar notificação: {response.text}")
+        # Envia via QuepasaAPI
+        success = await send_quepasa_message(
+            phone=target_number,
+            data={
+                "trackid": agent_id,
+                "text": notification_message
+            },
+            token=token
+        )
             
         logger.info(f"Notificação enviada para {target_number}")
-        return response.status_code == 200
+        return success
 
     except Exception as e:
         logger.error(f"Erro ao enviar notificação: {str(e)}")
         return False
 
-async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
+async def check_contact_limit(agent_id: str, contact_number: str) -> bool:
     """
     Verifica se o usuário atingiu o limite de contatos do seu plano.
     Retorna True se ainda está dentro do limite, False se excedeu.
     """
     try:
         # Busca o usuário responsável pelo assistente
-        logger.info(f"Verificando limite para assistente: {instance_name}")
+        logger.info(f"Verificando limite para assistente: {agent_id}")
         assistant_data = supabase.table('assistants').select(
             'user_id'
-        ).eq('instance_name', instance_name).execute()
+        ).eq('id', agent_id).execute()
         
         if not assistant_data.data or len(assistant_data.data) == 0:
-            logger.error(f"Assistente não encontrado: {instance_name}")
+            logger.error(f"Assistente não encontrado: {agent_id}")
             return True  # Permite continuar se não encontrar o assistente
         
         user_id = assistant_data.data[0]['user_id']
@@ -436,9 +442,62 @@ async def check_contact_limit(instance_name: str, contact_number: str) -> bool:
         # Em caso de erro, permite prosseguir
         return True
 
-async def send_whatsapp_messages(response_text: str, phone: str, instance_name: str, apikey: str, server_url: str):
+async def send_quepasa_message(phone: str, data: dict, token: str) -> bool:
+    """Função unificada para enviar mensagens via QuepasaAPI."""
+    try:
+        # Limpa o número de telefone (remove @s.whatsapp.net se existir)
+        if '@' in phone:
+            phone = phone.split('@')[0]
+            logger.info(f"Número de telefone limpo: {phone}")
+        
+        # Configura os dados básicos
+        payload = {
+            "chatid": phone,
+            "trackid": str(data.get("trackid", "agent")),  # Garantir que trackid seja string
+            "text": data.get("text", "")
+        }
+        
+        # Adiciona informações de mídia se fornecidas
+        if "mime" in data:
+            payload["mime"] = data["mime"]
+            payload["url"] = data.get("url", "")
+            payload["filename"] = data.get("filename", "")
+        
+        # Log para debug
+        logger.info(f"Enviando payload para Quepasa: {json.dumps(payload)}")
+        
+        # Envia a requisição com o token no header
+        headers = {
+            "Content-Type": "application/json",
+            "X-QUEPASA-TOKEN": token
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{QUEPASA_API_URL}/send",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+        logger.info(f"Resposta da requisição Quepasa: Status {response.status_code}")
+        if response.status_code >= 400:
+            logger.error(f"Erro na resposta Quepasa: {response.text}")
+            
+        return response.status_code in [200, 201, 202]
+    except Exception as e:
+        logger.error(f"Erro ao enviar mensagem via QuepasaAPI: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
+
+async def send_whatsapp_messages(response_text: str, phone: str, agent_id: str, token: str):
     """Divide a mensagem do assistente em partes e envia como mensagens separadas."""
     try:
+        # Limpa o número de telefone (remove @s.whatsapp.net se existir)
+        if '@' in phone:
+            phone = phone.split('@')[0]
+            logger.info(f"Número de telefone limpo: {phone}")
+            
         # Remove os separadores "---"
         response_text = re.sub(r'\s*---\s*', '\n', response_text)
         
@@ -509,19 +568,20 @@ async def send_whatsapp_messages(response_text: str, phone: str, instance_name: 
             logger.info(f"Parte {i+1}: {block[:50]}...")
         
         # Envia as mensagens
-        async with httpx.AsyncClient() as client:
-            for i, message in enumerate(blocks):
-                logger.info(f"Enviando parte {i+1}/{len(blocks)}")
-                
-                evolution_url = f"{server_url}/message/sendText/{instance_name}"
-                headers = {"Content-Type": "application/json", "apikey": apikey}
-                payload = {"number": phone, "text": message.strip(), "delay": 1200}
-                
-                response = await client.post(evolution_url, headers=headers, json=payload)
-                logger.info(f"Resposta da requisição {i+1}: Status {response.status_code}")
-                
-                if response.status_code != 200 and response.status_code != 201:
-                    logger.error(f"Erro ao enviar mensagem: {response.text}")
+        for i, message in enumerate(blocks):
+            logger.info(f"Enviando parte {i+1}/{len(blocks)}")
+            
+            success = await send_quepasa_message(
+                phone=phone,
+                data={
+                    "trackid": agent_id,
+                    "text": message.strip()
+                },
+                token=token
+            )
+            
+            if not success:
+                logger.error(f"Erro ao enviar mensagem {i+1}")
                 
                 # Pequena pausa entre mensagens
                 await asyncio.sleep(1)
@@ -538,20 +598,20 @@ async def send_transfer_request(
     phone: str,
     client_name: str,
     reason: str,
-    instance_name: str,
-    apikey: str,
-    server_url: str
+    agent_id: str,
+    token: str,
+    quepasa_wid: str
 ):
     """Solicita transferência do atendimento para um humano."""
     try:
         # Busca o usuário responsável pelo assistente
-        logger.info(f"Preparando transferência para humano. Instância: {instance_name}")
+        logger.info(f"Preparando transferência para humano. Agent ID: {agent_id}")
         assistant_data = supabase.table('assistants').select(
             'id, user_id'
-        ).eq('instance_name', instance_name).execute()
+        ).eq('id', agent_id).execute()
         
         if not assistant_data.data or len(assistant_data.data) == 0:
-            logger.error(f"Assistente não encontrado: {instance_name}")
+            logger.error(f"Assistente não encontrado: {agent_id}")
             return False
         
         user_id = assistant_data.data[0]['user_id']
@@ -598,7 +658,7 @@ async def send_transfer_request(
                 'status': 'cooldown',
                 'transfer_reason': reason,
                 'cooldown_until': (datetime.utcnow() + timedelta(hours=24)).isoformat()
-            }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+            }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
             logger.info(f"Status do contato {phone} atualizado para 'cooldown'")
         except Exception as e:
             logger.error(f"Erro ao atualizar status do contato: {str(e)}")
@@ -608,29 +668,19 @@ async def send_transfer_request(
             "Estou transferindo seu atendimento para um humano. Em breve alguém entrará em contato."
         )
         
-        evolution_url = f"{server_url}/message/sendText/{instance_name}"
+        # Envia mensagem via QuepasaAPI
+        success = await send_quepasa_message(
+            phone=phone,
+            data={
+                "trackid": agent_id,
+                "text": transfer_message
+            },
+            token=token
+        )
         
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": apikey
-        }
-        
-        payload = {
-            "number": phone,
-            "text": transfer_message,
-            "delay": 1200
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                evolution_url,
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code != 200 and response.status_code != 201:
-                logger.error(f"Erro ao enviar mensagem de transferência: {response.text}")
-                return False
+        if not success:
+            logger.error("Erro ao enviar mensagem de transferência")
+            return False
         
         # Envia notificação para o número de transferência
         if transfer_number:
@@ -639,9 +689,8 @@ async def send_transfer_request(
                 client_number=phone,
                 client_name=client_name,
                 context=reason,
-                instance_name=instance_name,
-                apikey=apikey,
-                server_url=server_url
+                agent_id=agent_id,
+                token=token
             )
         
         logger.info(f"Solicitação de transferência processada para {phone}")
@@ -651,12 +700,12 @@ async def send_transfer_request(
         logger.error(f"Erro ao processar transferência: {str(e)}")
         return False
 
-async def update_contact_stage(phone: str, stage: str, instance_name: str) -> bool:
+async def update_contact_stage(phone: str, stage: str, quepasa_wid: str) -> bool:
     """Atualiza o estágio do contato no banco de dados."""
     try:
         data = supabase.table('contacts').update(
             {"etapa": stage}
-        ).eq('whatsapp', phone).execute()
+        ).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
         
         logger.info(f"Estágio do contato {phone} atualizado para: {stage}")
         
@@ -670,7 +719,7 @@ async def update_contact_stage(phone: str, stage: str, instance_name: str) -> bo
         logger.error(f"Detalhes do erro: phone={phone}, stage={stage}")
         return False
 
-async def send_image(phone: str, instance_name: str, apikey: str, server_url: str, media_id: str) -> bool:
+async def send_image(phone: str, agent_id: str, token: str, media_id: str) -> bool:
     """Envia uma imagem para o usuário usando o ID da mídia do banco de dados."""
     try:
         # Busca a imagem no banco de dados
@@ -683,43 +732,30 @@ async def send_image(phone: str, instance_name: str, apikey: str, server_url: st
         image_link = response.data[0]['link']
         logger.info(f"Link da imagem encontrado: {image_link}")
         
-        # Prepara a requisição para a Evolution API
-        evolution_url = f"{server_url}/message/sendMedia/{instance_name}"
+        # Obtém o nome do arquivo a partir do link
+        filename = image_link.split('/')[-1]
         
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": apikey
-        }
-        
-        payload = {
-            "number": phone,
-            "mediatype": "image",
-            "mimetype": "image/jpeg",
-            "media": image_link,
-            "fileName": "imagem.jpg",
-            "delay": 1200
-        }
-        
-        # Envia a requisição
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                evolution_url,
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code != 200 and response.status_code != 201:
-                logger.error(f"Erro ao enviar imagem: {response.text}")
-                return False
+        # Envia via QuepasaAPI
+        success = await send_quepasa_message(
+            phone=phone,
+            data={
+                "trackid": agent_id,
+                "text": "",
+                "mime": "image/png",
+                "url": image_link,
+                "filename": filename
+            },
+            token=token
+        )
                 
-        logger.info(f"Imagem enviada com sucesso para {phone}")
-        return True
+        logger.info(f"Imagem enviada com sucesso para {phone}" if success else f"Falha ao enviar imagem para {phone}")
+        return success
         
     except Exception as e:
         logger.error(f"Erro ao enviar imagem: {str(e)}")
         return False
 
-async def send_audio(phone: str, instance_name: str, apikey: str, server_url: str, media_id: str) -> bool:
+async def send_audio(phone: str, agent_id: str, token: str, media_id: str) -> bool:
     """Envia um áudio para o usuário usando o ID da mídia do banco de dados."""
     try:
         # Busca o áudio no banco de dados
@@ -732,40 +768,30 @@ async def send_audio(phone: str, instance_name: str, apikey: str, server_url: st
         audio_link = response.data[0]['link']
         logger.info(f"Link do áudio encontrado: {audio_link}")
         
-        # Prepara a requisição para a Evolution API
-        evolution_url = f"{server_url}/message/sendWhatsAppAudio/{instance_name}"
+        # Obtém o nome do arquivo a partir do link
+        filename = audio_link.split('/')[-1]
         
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": apikey
-        }
-        
-        payload = {
-            "number": phone,
-            "audio": audio_link,
-            "delay": 1200
-        }
-        
-        # Envia a requisição
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                evolution_url,
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code != 200 and response.status_code != 201:
-                logger.error(f"Erro ao enviar áudio: {response.text}")
-                return False
+        # Envia via QuepasaAPI
+        success = await send_quepasa_message(
+            phone=phone,
+            data={
+                "trackid": agent_id,
+                "text": "",
+                "mime": "audio/ogg",
+                "url": audio_link,
+                "filename": filename
+            },
+            token=token
+        )
                 
-        logger.info(f"Áudio enviado com sucesso para {phone}")
-        return True
+        logger.info(f"Áudio enviado com sucesso para {phone}" if success else f"Falha ao enviar áudio para {phone}")
+        return success
         
     except Exception as e:
         logger.error(f"Erro ao enviar áudio: {str(e)}")
         return False
 
-async def send_video(phone: str, instance_name: str, apikey: str, server_url: str, media_id: str) -> bool:
+async def send_video(phone: str, agent_id: str, token: str, media_id: str) -> bool:
     """Envia um vídeo para o usuário usando o ID da mídia do banco de dados."""
     try:
         # Busca o vídeo no banco de dados
@@ -778,45 +804,32 @@ async def send_video(phone: str, instance_name: str, apikey: str, server_url: st
         video_link = response.data[0]['link']
         logger.info(f"Link do vídeo encontrado: {video_link}")
         
-        # Prepara a requisição para a Evolution API
-        evolution_url = f"{server_url}/message/sendMedia/{instance_name}"
+        # Obtém o nome do arquivo a partir do link
+        filename = video_link.split('/')[-1]
         
-        headers = {
-            "Content-Type": "application/json",
-            "apikey": apikey
-        }
-        
-        payload = {
-            "number": phone,
-            "mediatype": "video",
-            "mimetype": "video/mp4",
-            "media": video_link,
-            "fileName": "video.mp4",
-            "delay": 1200
-        }
-        
-        # Envia a requisição
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                evolution_url,
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code != 200 and response.status_code != 201:
-                logger.error(f"Erro ao enviar vídeo: {response.text}")
-                return False
+        # Envia via QuepasaAPI
+        success = await send_quepasa_message(
+            phone=phone,
+            data={
+                "trackid": agent_id,
+                "text": "",
+                "mime": "video/mp4",
+                "url": video_link,
+                "filename": filename
+            },
+            token=token
+        )
                 
-        logger.info(f"Vídeo enviado com sucesso para {phone}")
-        return True
+        logger.info(f"Vídeo enviado com sucesso para {phone}" if success else f"Falha ao enviar vídeo para {phone}")
+        return success
         
     except Exception as e:
         logger.error(f"Erro ao enviar vídeo: {str(e)}")
         return False
 
-async def process_delayed_message(phone: str, instance_name: str, apikey: str, server_url: str):
+async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa_wid: str, openai_assistant_id: str):
     # Define a chave única no início da função
-    key = f"{phone}:{instance_name}"
+    key = f"{phone}:{agent_id}"
     
     try:
         # Espera 5 segundos
@@ -837,7 +850,7 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
         logger.info(f"Processando {len(messages)} mensagens concatenadas para {phone}")
         
         # Processa a mensagem concatenada
-        contact = await check_and_create_contact(phone, instance_name, "", False)
+        contact = await check_and_create_contact(phone, quepasa_wid, "", False)
         
         if not contact:
             logger.info(f"Contato {phone} não encontrado")
@@ -847,8 +860,22 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
             logger.info(f"Contato {phone} está {contact['status']}")
             return
             
-        # Usa a thread existente do contato
-        thread_id = contact['thread_id']
+        # Verifica se a thread existente é válida ou se precisa criar uma nova
+        thread_id = contact.get('thread_id')
+        if not thread_id:
+            # Cria uma nova thread se thread_id for nulo
+            logger.info(f"Thread ID nula para o contato {phone}. Criando nova thread...")
+            thread = openai_client.beta.threads.create()
+            thread_id = thread.id
+            
+            # Atualiza o contato com a nova thread_id
+            try:
+                supabase.table('contacts').update({
+                    'thread_id': thread_id
+                }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+                logger.info(f"Contato {phone} atualizado com nova thread_id: {thread_id}")
+            except Exception as e:
+                logger.error(f"Erro ao atualizar thread_id do contato: {str(e)}")
         
         # Antes de criar uma nova mensagem, verifica e cancela runs ativas
         try:
@@ -872,10 +899,11 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
         )
         logger.info(f"Mensagens concatenadas adicionadas à thread: {thread_message.id}")
         
-        # Executa o assistente
+        # Executa o assistente usando o ID correto do OpenAI
+        logger.info(f"Executando assistente com ID OpenAI: {openai_assistant_id}")
         run = openai_client.beta.threads.runs.create(
             thread_id=thread_id,
-            assistant_id=instance_name
+            assistant_id=openai_assistant_id  # Usa o ID do assistente na OpenAI (formato asst_XXX)
         )
         
         # Adiciona timeout e tratamento de estados de erro
@@ -900,7 +928,7 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                         
                         if function_name == 'solicitar_transferencia':
                             # Obtém informações do contato
-                            contact = await check_and_create_contact(phone, instance_name, "", False)
+                            contact = await check_and_create_contact(phone, quepasa_wid, "", False)
                             client_name = contact.get('name', 'Nome não disponível')
                             
                             # Obtém o motivo da transferência
@@ -911,9 +939,9 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                                 phone=phone,
                                 client_name=client_name,
                                 reason=reason,
-                                instance_name=instance_name,
-                                apikey=apikey,
-                                server_url=server_url
+                                agent_id=agent_id,
+                                token=token,
+                                quepasa_wid=quepasa_wid
                             )
                             
                             tool_outputs.append({
@@ -930,7 +958,7 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             stage = function_args.get('estagio')
                             
                             # Atualiza o estágio do contato
-                            success = await update_contact_stage(phone, stage, instance_name)
+                            success = await update_contact_stage(phone, stage, quepasa_wid)
                             
                             tool_outputs.append({
                                 "tool_call_id": tool_call.id,
@@ -948,9 +976,8 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             # Envia a imagem
                             success = await send_image(
                                 phone=phone,
-                                instance_name=instance_name,
-                                apikey=apikey,
-                                server_url=server_url,
+                                agent_id=agent_id,
+                                token=token,
                                 media_id=media_id
                             )
                             
@@ -970,9 +997,8 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             # Envia o áudio
                             success = await send_audio(
                                 phone=phone,
-                                instance_name=instance_name,
-                                apikey=apikey,
-                                server_url=server_url,
+                                agent_id=agent_id,
+                                token=token,
                                 media_id=media_id
                             )
                             
@@ -992,9 +1018,8 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
                             # Envia o vídeo
                             success = await send_video(
                                 phone=phone,
-                                instance_name=instance_name,
-                                apikey=apikey,
-                                server_url=server_url,
+                                agent_id=agent_id,
+                                token=token,
                                 media_id=media_id
                             )
                             
@@ -1064,9 +1089,8 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
         success = await send_whatsapp_messages(
             response_text=response_text,
             phone=phone,
-            instance_name=instance_name,
-            apikey=apikey,
-            server_url=server_url
+            agent_id=agent_id,
+            token=token
         )
         
         if success:
@@ -1090,41 +1114,89 @@ async def process_delayed_message(phone: str, instance_name: str, apikey: str, s
             del pending_tasks[key]
 
 @app.post("/webhook")
-async def webhook(data: WhatsAppWebhook):
+async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias="x-quepasa-wid")):
     try:
-        log_with_instance("Nova requisição recebida no webhook", data.instance)
-        log_with_instance(f"Dados recebidos: {data}", data.instance)
+        # Extrai informações do corpo da mensagem
+        message = data.body
+        message_id = message.id
+        message_type = message.type
         
-        # Verifica se é um evento de mensagem
-        if data.event != "messages.upsert":
-            log_with_instance(f"Evento ignorado: {data.event}", data.instance)
-            return {"success": True, "message": "Evento ignorado"}
-
-        # Extrai informações relevantes
-        phone = data.data.key.remoteJid.split('@')[0]
-        instance_name = data.instance
-        push_name = data.data.pushName
-        from_me = data.data.key.fromMe
-        message_type = data.data.messageType
+        # Extrai número do telefone e nome do chat
+        phone = message.chat.id.split('@')[0]
+        push_name = message.chat.title or f"User {phone}"
         
-        log_with_instance(f"Processando mensagem de {phone}", instance_name)
-        log_with_instance(f"Tipo de mensagem: {message_type}", instance_name)
-        log_with_instance(f"De mim: {from_me}", instance_name)
+        # Trata o campo fromme que pode vir como string "false" ou "true"
+        if isinstance(message.fromme, str):
+            from_me = message.fromme.lower() == "true"
+        else:
+            from_me = bool(message.fromme)
+            
+        logger.info(f"From me original: {message.fromme}, convertido: {from_me}")
+        
+        # O cabeçalho vem como "x-quepasa-wid" mas usamos quepasa_wid no banco de dados
+        quepasa_wid = x_quepasa_wid
+        logger.info(f"Cabeçalho x-quepasa-wid recebido: {quepasa_wid}")
+        
+        if not quepasa_wid:
+            logger.error("Cabeçalho x-quepasa-wid não encontrado na requisição")
+            return {"success": False, "message": "Header x-quepasa-wid ausente"}
+        
+        # Busca o assistente pelo assistant_id em vez de x-quepasa-wid
+        response = supabase.table('assistants').select('id, token, assistant_id').eq('assistant_id', quepasa_wid).execute()
+        
+        if not response.data or len(response.data) == 0:
+            logger.error(f"Nenhum assistente encontrado para assistant_id: {quepasa_wid}")
+            # Tenta buscar todos os assistentes para debug
+            all_assistants = supabase.table('assistants').select('id, token, assistant_id').execute()
+            logger.info(f"Assistentes disponíveis: {len(all_assistants.data) if all_assistants.data else 0}")
+            
+            if all_assistants.data:
+                logger.info(f"Colunas disponíveis: {list(all_assistants.data[0].keys())}")
+                
+                # Verificar se existe um assistente para este assistant_id
+                try:
+                    resp_alt = supabase.table('assistants').select('id, token, assistant_id').eq('assistant_id', quepasa_wid).execute()
+                    if resp_alt.data and len(resp_alt.data) > 0:
+                        logger.info(f"Assistente encontrado usando coluna 'assistant_id': {resp_alt.data[0]['id']}")
+                        response = resp_alt
+                    else:
+                        logger.error(f"Assistente não encontrado com 'assistant_id' também")
+                except Exception as e:
+                    logger.error(f"Erro ao buscar com assistant_id: {str(e)}")
+            
+            if not response.data or len(response.data) == 0:
+                return {"success": False, "message": "Assistente não configurado para este número"}
+        
+        agent_data = response.data[0]
+        agent_id = agent_data['id']
+        token = agent_data['token']
+        openai_assistant_id = agent_data.get('assistant_id')  # ID do assistente na OpenAI - coluna correta
+        
+        if not openai_assistant_id:
+            logger.error(f"ID do assistente na OpenAI não encontrado para o agente {agent_id}")
+            return {"success": False, "message": "Assistente não configurado corretamente (falta ID OpenAI)"}
+        
+        logger.info(f"ID do assistente na OpenAI: {openai_assistant_id}")
+        
+        log_with_instance("Nova requisição recebida no webhook", agent_id)
+        log_with_instance(f"Processando mensagem de {phone}", agent_id)
+        log_with_instance(f"Tipo de mensagem: {message_type}", agent_id)
+        log_with_instance(f"De mim: {from_me}", agent_id)
 
         # Primeiro, verifica o status atual do contato
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
-        log_with_instance(f"Status atual do contato {phone}: {current_status}", instance_name)
+        log_with_instance(f"Status atual do contato {phone}: {current_status}", agent_id)
 
-        # Se a mensagem é do usuário (fromMe = true)
+        # Se a mensagem é do sistema/usuário dono do bot (fromMe = true)
         if from_me:
-            log_with_instance(f"Mensagem enviada pelo usuário para {phone}", instance_name)
+            log_with_instance(f"Mensagem enviada pelo sistema/dono para {phone}", agent_id)
             try:
                 # Se o status atual é 'pausado', mantém pausado
                 if current_status == 'pausado':
-                    log_with_instance(f"Contato {phone} mantido como pausado", instance_name)
+                    log_with_instance(f"Contato {phone} mantido como pausado", agent_id)
                     return {"success": True, "message": "Contato mantido como pausado"}
                 
                 # Caso contrário, atualiza para cooldown
@@ -1134,28 +1206,33 @@ async def webhook(data: WhatsAppWebhook):
                     'status': 'cooldown',
                     'cooldown_until': cooldown_end,
                     'from_me': True
-                }).eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+                }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
                 
-                log_with_instance(f"Contato {phone} colocado em cooldown por 24 horas", instance_name)
-                return {"success": True, "message": "Contato em cooldown após mensagem do usuário"}
+                log_with_instance(f"Contato {phone} colocado em cooldown por 24 horas", agent_id)
+                return {"success": True, "message": "Contato em cooldown após mensagem do sistema/dono"}
             except Exception as e:
-                log_with_instance(f"Erro ao atualizar status do contato: {str(e)}", instance_name, "ERROR")
+                log_with_instance(f"Erro ao atualizar status do contato: {str(e)}", agent_id, "ERROR")
                 return {"success": False, "message": "Erro ao atualizar status do contato"}
+        
+        # Se a mensagem é do cliente (fromMe = false)
+        else:
+            log_with_instance(f"Mensagem recebida do cliente {phone}", agent_id)
+            # Continua o processamento normal para mensagens do cliente
 
         # Verifica novamente o status após qualquer atualização
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
-        log_with_instance(f"Status verificado novamente para {phone}: {current_status}", instance_name)
+        log_with_instance(f"Status verificado novamente para {phone}: {current_status}", agent_id)
 
         # Se o contato está em cooldown ou pausado, não processa a mensagem
         if current_status in ['cooldown', 'pausado']:
-            log_with_instance(f"Mensagem descartada para {phone}. Status: {current_status}", instance_name)
+            log_with_instance(f"Mensagem descartada para {phone}. Status: {current_status}", agent_id)
             return {"success": False, "message": f"Contato {current_status}"}
 
         # Verifica limite de contatos
-        within_limit = await check_contact_limit(instance_name, phone)
+        within_limit = await check_contact_limit(agent_id, phone)
         
         if not within_limit:
             # Se excedeu o limite, envia mensagem informando
@@ -1164,31 +1241,21 @@ async def webhook(data: WhatsAppWebhook):
                 "Por favor, entre em contato com o suporte para upgrade do plano."
             )
             
-            evolution_url = f"{data.server_url}/message/sendText/{instance_name}"
+            # Envia via QuepasaAPI
+            await send_quepasa_message(
+                phone=phone,
+                data={
+                    "trackid": agent_id,
+                    "text": message
+                },
+                token=token
+            )
             
-            headers = {
-                "Content-Type": "application/json",
-                "apikey": data.apikey
-            }
-            
-            payload = {
-                "number": phone,
-                "text": message,
-                "delay": 1200
-            }
-            
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    evolution_url,
-                    headers=headers,
-                    json=payload
-                )
-            
-            logger.warning(f"Limite de contatos excedido para instância {instance_name}")
+            logger.warning(f"Limite de contatos excedido para agente {agent_id}")
             return {"status": "error", "message": "Contact limit exceeded"}
 
         # Verifica o status uma última vez antes de processar a mensagem
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
@@ -1199,66 +1266,33 @@ async def webhook(data: WhatsAppWebhook):
         # Processa diferentes tipos de mensagem
         user_message = ""
         
-        if message_type == "conversation":
-            user_message = data.data.message.conversation
-        elif message_type == "imageMessage":
+        if message_type == "text":
+            # Mensagem de texto simples
+            user_message = message.text
+        elif message_type == "image":
             try:
-                # Usa o jpegThumbnail que já vem em base64
-                image_base64 = data.data.message.imageMessage.jpegThumbnail
+                # Processa a imagem usando a nova função
+                image_description = await process_quepasa_image(message_id, token)
                 
-                # Se o thumbnail estiver disponível, processa a imagem
-                if image_base64:
-                    logger.info("Processando imagem com GPT-4o")
-                    # Obtem descrição da imagem
-                    response = openai_client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Descreva detalhadamente esta imagem em português."
-                                    },
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": f"data:image/jpeg;base64,{image_base64}"
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        max_tokens=500
-                    )
-                    image_description = response.choices[0].message.content
-                    logger.info(f"Descrição da imagem gerada: {image_description[:100]}...")
-                    # Envia a descrição como contexto para o assistente
-                    user_message = f"O usuário enviou uma imagem. Descrição da imagem: {image_description}"
-                    logger.info("Enviando descrição para o assistente como contexto")
-                else:
-                    user_message = "O usuário enviou uma imagem que não foi possível processar."
-                    logger.info("Imagem sem thumbnail disponível")
+                # Envia a descrição como contexto para o assistente
+                user_message = f"O usuário enviou uma imagem. Descrição da imagem: {image_description}"
+                logger.info("Enviando descrição para o assistente como contexto")
             except Exception as e:
                 logger.error(f"Erro ao processar imagem: {str(e)}")
                 user_message = "O usuário enviou uma imagem que não foi possível processar."
-        elif message_type == "audioMessage":
+        elif message_type == "audio":
             try:
-                # Obtém o áudio diretamente do campo base64
-                if hasattr(data.data.message, "base64") and data.data.message.base64:
-                    audio_base64 = data.data.message.base64
-                    
-                    # Transcreve o áudio
-                    transcription = await process_audio(audio_base64)
-                    logger.info(f"Transcrição do áudio gerada: {transcription[:100]}...")
-                    
-                    # Envia a transcrição como contexto para o assistente
-                    user_message = f"O usuário enviou um áudio. Transcrição do áudio: {transcription}"
-                else:
-                    user_message = "O usuário enviou um áudio que não foi possível transcrever."
-                    logger.info("Áudio sem dados base64 disponíveis")
+                # Processa o áudio usando a nova função
+                logger.info(f"Iniciando processamento de áudio para message_id: {message_id}")
+                transcription = await process_quepasa_audio(message_id, token)
+                
+                logger.info(f"Áudio processado com sucesso. Transcrição: {transcription}")
+                
+                # Envia a transcrição como contexto para o assistente
+                user_message = f"O usuário enviou um áudio. Transcrição do áudio: {transcription}"
             except Exception as e:
                 logger.error(f"Erro ao processar áudio: {str(e)}")
+                logger.error(traceback.format_exc())
                 user_message = "O usuário enviou um áudio que não foi possível transcrever."
         else:
             logger.warning(f"Tipo de mensagem não suportado: {message_type}")
@@ -1268,7 +1302,7 @@ async def webhook(data: WhatsAppWebhook):
             return {"success": False, "message": "Mensagem vazia"}
 
         # Verifica o status uma última vez antes de adicionar à fila
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('instance_name', instance_name).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
@@ -1277,36 +1311,49 @@ async def webhook(data: WhatsAppWebhook):
             return {"success": False, "message": f"Contato {current_status}"}
 
         # Adiciona a mensagem à lista de mensagens pendentes
-        key = f"{phone}:{instance_name}"
+        key = f"{phone}:{agent_id}"
         if key not in pending_messages:
             pending_messages[key] = []
         
         pending_messages[key].append(user_message)
-        log_with_instance(f"Mensagem adicionada à fila para {phone}. Total: {len(pending_messages[key])}", instance_name)
+        log_with_instance(f"Mensagem adicionada à fila para {phone}. Total: {len(pending_messages[key])}", agent_id)
         
         # Se já existe uma tarefa pendente para este contato, não cria outra
         if key in pending_tasks and not pending_tasks[key].done():
-            log_with_instance(f"Já existe uma tarefa pendente para {key}", instance_name)
+            log_with_instance(f"Já existe uma tarefa pendente para {key}", agent_id)
             return {"success": True, "message": "Mensagem adicionada à fila existente"}
             
         # Cria uma nova tarefa para processar após 5 segundos
         task = asyncio.create_task(
-            process_delayed_message(phone, instance_name, data.apikey, data.server_url)
+            process_delayed_message(
+                phone=phone, 
+                agent_id=agent_id, 
+                token=token, 
+                quepasa_wid=quepasa_wid,
+                openai_assistant_id=openai_assistant_id
+            )
         )
         pending_tasks[key] = task
-        log_with_instance(f"Nova tarefa de processamento criada para {key}", instance_name)
+        log_with_instance(f"Nova tarefa de processamento criada para {key}", agent_id)
 
         return {"success": True, "message": "Mensagem adicionada à fila"}
 
     except Exception as e:
-        log_with_instance(f"Erro no processamento: {str(e)}", data.instance, "ERROR")
+        # Tenta identificar o agent_id para log, caso não tenha sido definido ainda
+        agent_id = "unknown"
+        if hasattr(data, 'body') and hasattr(data.body, 'chat'):
+            phone = data.body.chat.id.split('@')[0]
+            logger.error(f"Erro no processamento para {phone}: {str(e)}")
+        
+        log_with_instance(f"Erro no processamento: {str(e)}", agent_id, "ERROR")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
-        "evolution_api": EVOLUTION_API_URL,
+        "quepasa_api": QUEPASA_API_URL,
         "openai": "configured"
     }
 
@@ -1335,6 +1382,106 @@ async def download_audio(url: str, headers: Dict) -> str:
     except Exception as e:
         logger.error(f"Erro ao baixar áudio: {str(e)}")
         raise
+
+# Função para baixar mídia do Quepasa
+async def download_quepasa_media(message_id: str, token: str) -> Optional[bytes]:
+    """Baixa mídia (áudio ou imagem) da API Quepasa."""
+    try:
+        headers = {
+            "X-QUEPASA-TOKEN": token
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{QUEPASA_API_URL}/download/{message_id}?cache=false",
+                headers=headers,
+                timeout=30
+            )
+            
+        if response.status_code != 200:
+            logger.error(f"Erro ao baixar mídia. Status: {response.status_code}")
+            return None
+            
+        logger.info(f"Mídia baixada com sucesso. Tamanho: {len(response.content)} bytes")
+        return response.content
+    except Exception as e:
+        logger.error(f"Erro ao baixar mídia: {str(e)}")
+        return None
+
+# Função para processar áudio do Quepasa
+async def process_quepasa_audio(message_id: str, token: str) -> str:
+    """Processa o áudio baixado da API Quepasa e retorna a transcrição."""
+    try:
+        # Baixa o áudio
+        audio_data = await download_quepasa_media(message_id, token)
+        if not audio_data:
+            return "[Não foi possível baixar o áudio]"
+        
+        # Salva em arquivo temporário
+        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as temp_audio:
+            temp_audio.write(audio_data)
+            temp_audio_path = temp_audio.name
+        
+        logger.info(f"Arquivo de áudio salvo temporariamente em: {temp_audio_path}")
+        
+        # Transcreve o áudio usando OpenAI
+        with open(temp_audio_path, 'rb') as audio_file:
+            transcript = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        
+        # Limpa o arquivo temporário
+        os.unlink(temp_audio_path)
+        
+        # Log do resultado da transcrição
+        logger.info(f"Transcrição do áudio concluída: {transcript.text}")
+        
+        return transcript.text
+    except Exception as e:
+        logger.error(f"Erro ao processar áudio: {str(e)}")
+        logger.error(traceback.format_exc())
+        return "[Não foi possível transcrever o áudio]"
+
+# Função para processar imagem do Quepasa
+async def process_quepasa_image(message_id: str, token: str) -> str:
+    """Processa a imagem baixada da API Quepasa e retorna a descrição."""
+    try:
+        # Baixa a imagem
+        image_data = await download_quepasa_media(message_id, token)
+        if not image_data:
+            return "[Não foi possível baixar a imagem]"
+        
+        # Converte para base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # Analisa a imagem usando gpt-4o
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Descreva detalhadamente esta imagem em português."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=500
+        )
+        
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Erro ao processar imagem: {str(e)}")
+        return "[Não foi possível analisar a imagem]"
 
 if __name__ == "__main__":
     import uvicorn
