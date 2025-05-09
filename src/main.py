@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
@@ -15,6 +16,7 @@ import re
 import traceback
 import json
 import sys
+import pytz
 
 # Configuração de logging com UTF-8
 logging.basicConfig(
@@ -74,6 +76,34 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     logger.error("SUPABASE_URL ou SUPABASE_KEY não definidas no ambiente")
 
 app = FastAPI(title="WhatsApp GPT Bot")
+
+# Configuração CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite todas as origens
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite todos os métodos
+    allow_headers=["*"],  # Permite todos os headers
+)
+
+# Middleware para log de todas as requisições
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"=== NOVA REQUISIÇÃO RECEBIDA ===")
+    logger.info(f"URL: {request.url}")
+    logger.info(f"Método: {request.method}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    
+    # Tenta ler o corpo da requisição
+    try:
+        body = await request.body()
+        logger.info(f"Corpo da requisição: {body.decode()}")
+    except Exception as e:
+        logger.error(f"Erro ao ler corpo da requisição: {str(e)}")
+    
+    response = await call_next(request)
+    return response
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -156,10 +186,18 @@ class QuepasaMessage(BaseModel):
 class QuepasaWebhook(BaseModel):
     body: QuepasaMessage
 
-async def check_and_create_contact(phone: str, quepasa_wid: str, push_name: str, from_me: bool) -> Optional[Dict]:
+async def check_and_create_contact(phone: str, quepasa_wid: str, push_name: str, from_me: bool, chat_title: str = None) -> Optional[Dict]:
     try:
         # Limpa o número do telefone (remove @s.whatsapp.net)
         phone = phone.split('@')[0]
+        
+        # Busca o assistente para obter o assistant_id
+        assistant_response = supabase.table('assistants').select('assistant_id').eq('x-quepasa-wid', quepasa_wid).execute()
+        if not assistant_response.data or len(assistant_response.data) == 0:
+            logger.error(f"Assistente não encontrado para x-quepasa-wid: {quepasa_wid}")
+            raise Exception("Assistente não encontrado")
+            
+        assistant_id = assistant_response.data[0]['assistant_id']
         
         # Busca o contato - Usando nome real da coluna 'x-quepasa-wid'
         response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
@@ -168,7 +206,7 @@ async def check_and_create_contact(phone: str, quepasa_wid: str, push_name: str,
             # Se não existe, cria um novo contato
             thread = openai_client.beta.threads.create()
             new_contact = {
-                'name': push_name or f'User {phone}',
+                'name': chat_title or push_name or f'User {phone}',  # Usa chat_title como prioridade
                 'whatsapp': phone,
                 'status': 'ativo',
                 'x-quepasa-wid': quepasa_wid,
@@ -176,7 +214,8 @@ async def check_and_create_contact(phone: str, quepasa_wid: str, push_name: str,
                 'thread_id': thread.id,
                 'followup': False,
                 'etapa': 'conexão',
-                'from_me': from_me
+                'from_me': from_me,
+                'instance_name': assistant_id
             }
             response = supabase.table('contacts').insert(new_contact).execute()
             logger.info(f"Novo contato criado: {phone}")
@@ -191,15 +230,17 @@ async def check_and_create_contact(phone: str, quepasa_wid: str, push_name: str,
                 'from_me': True,
                 'status': 'cooldown',
                 'cooldown_until': cooldown_end,
-                'thread_id': contact.get('thread_id')  # Preserva o thread_id
+                'thread_id': contact.get('thread_id'),  # Preserva o thread_id
+                'instance_name': assistant_id
             }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
             logger.info(f"Contato {phone} entrou em cooldown")
         else:
             supabase.table('contacts').update({
                 'last_contact': datetime.utcnow().isoformat(),
-                'name': push_name or contact['name'],
+                'name': chat_title or push_name or contact['name'],  # Usa chat_title como prioridade
                 'thread_id': contact.get('thread_id'),  # Preserva o thread_id
-                'status': 'ativo'  # Garantindo que seja 'ativo' em vez de 'active'
+                'status': 'ativo',  # Garantindo que seja 'ativo' em vez de 'active'
+                'instance_name': assistant_id
             }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
             logger.info(f"Contato {phone} atualizado")
         
@@ -827,7 +868,7 @@ async def send_video(phone: str, agent_id: str, token: str, media_id: str) -> bo
         logger.error(f"Erro ao enviar vídeo: {str(e)}")
         return False
 
-async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa_wid: str, openai_assistant_id: str):
+async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa_wid: str, openai_assistant_id: str, chat_title: str):
     # Define a chave única no início da função
     key = f"{phone}:{agent_id}"
     
@@ -850,7 +891,7 @@ async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa
         logger.info(f"Processando {len(messages)} mensagens concatenadas para {phone}")
         
         # Processa a mensagem concatenada
-        contact = await check_and_create_contact(phone, quepasa_wid, "", False)
+        contact = await check_and_create_contact(phone, quepasa_wid, "", False, chat_title)
         
         if not contact:
             logger.info(f"Contato {phone} não encontrado")
@@ -892,10 +933,28 @@ async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa
             logger.error(f"Erro ao cancelar run: {str(e)}")
 
         # Agora podemos adicionar a nova mensagem com segurança
+        # Adiciona informações de contexto do cliente
+        brasilia_tz = pytz.timezone('America/Sao_Paulo')
+        now = datetime.now(brasilia_tz)
+        date_str = now.strftime("%d/%m/%Y")
+        time_str = now.strftime("%H:%M:%S")
+        
+        # Adiciona cabeçalho com informações do cliente à mensagem
+        contact_info = f"""
+INFORMAÇÕES DO CLIENTE:
+Número: {phone}
+Nome: {chat_title or "Não informado"}
+Data atual: {date_str} 
+Hora atual (Brasília): {time_str}
+
+MENSAGEM:
+{concatenated_message}
+"""
+        
         thread_message = openai_client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
-            content=concatenated_message
+            content=contact_info
         )
         logger.info(f"Mensagens concatenadas adicionadas à thread: {thread_message.id}")
         
@@ -928,7 +987,7 @@ async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa
                         
                         if function_name == 'solicitar_transferencia':
                             # Obtém informações do contato
-                            contact = await check_and_create_contact(phone, quepasa_wid, "", False)
+                            contact = await check_and_create_contact(phone, quepasa_wid, "", False, chat_title)
                             client_name = contact.get('name', 'Nome não disponível')
                             
                             # Obtém o motivo da transferência
@@ -1032,6 +1091,122 @@ async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa
                             })
                             
                             logger.info(f"Função enviar_video processada para {phone}: {media_id}")
+                        
+                        elif function_name == 'agendamento':
+                            # Obtém os dados do agendamento
+                            title = function_args.get('title', '')
+                            description = function_args.get('description', '')
+                            customer_name = function_args.get('customer_name', '')
+                            customer_contact = function_args.get('customer_contact', '')
+                            appointment_date = function_args.get('appointment_date', '')
+                            appointment_time = function_args.get('appointment_time', '')
+                            end_time = function_args.get('end_time', '')
+                            location = function_args.get('location', '')
+                            service_type = function_args.get('service_type', '')
+                            status = function_args.get('status', 'agendado')
+                            notes = function_args.get('notes', '')
+                            
+                            try:
+                                # Obtém o user_id do assistente - tentando várias abordagens
+                                logger.info(f"DEBUG - Tentando obter user_id para assistente_id: {agent_id}")
+                                
+                                # Primeiro, tenta buscar pelo id do assistente (caso seja o id da tabela)
+                                logger.info(f"DEBUG - Tentativa 1: Buscando pelo id na tabela")
+                                assistant_response = supabase.table('assistants').select('*').eq('id', agent_id).execute()
+                                
+                                # Se não encontrar, tenta pelo assistant_id
+                                if not assistant_response.data or len(assistant_response.data) == 0:
+                                    logger.info(f"DEBUG - Tentativa 2: Buscando pelo assistant_id")
+                                    assistant_response = supabase.table('assistants').select('*').eq('assistant_id', agent_id).execute()
+                                
+                                # Se ainda não encontrar, tenta buscar pelo token (que às vezes é usado como assistant_id)
+                                if not assistant_response.data or len(assistant_response.data) == 0:
+                                    logger.info(f"DEBUG - Tentativa 3: Buscando pelo token")
+                                    assistant_response = supabase.table('assistants').select('*').eq('token', agent_id).execute()
+                                
+                                # Se ainda não encontrar, tenta buscar assistentes que tenham o mesmo domínio no token
+                                if not assistant_response.data or len(assistant_response.data) == 0:
+                                    logger.info(f"DEBUG - Tentativa 4: Buscando pelo domínio Quepasa")
+                                    assistant_response = supabase.table('assistants').select('*').eq('x-quepasa-wid', quepasa_wid).execute()
+                                
+                                # Final fallback - obtém qualquer assistente
+                                if not assistant_response.data or len(assistant_response.data) == 0:
+                                    logger.info(f"DEBUG - Tentativa 5: Buscando qualquer assistente")
+                                    assistant_response = supabase.table('assistants').select('*').limit(1).execute()
+                                    
+                                    if not assistant_response.data or len(assistant_response.data) == 0:
+                                        logger.error(f"DEBUG - Não foi possível encontrar nenhum assistente")
+                                        # Usando UUID fixo como último recurso
+                                        logger.info(f"DEBUG - Último recurso: Usando UUID fixo")
+                                        user_id = '0b411149-a240-4eb7-ba94-920f6be08bb9'  # ID que vimos na imagem
+                                    else:
+                                        logger.info(f"DEBUG - Encontrado um assistente como fallback: {assistant_response.data[0]}")
+                                        user_id = assistant_response.data[0]['user_id']
+                                else:
+                                    logger.info(f"DEBUG - Assistente encontrado: {assistant_response.data[0]}")
+                                    user_id = assistant_response.data[0]['user_id']
+                                
+                                logger.info(f"DEBUG - User ID final para agendamento: {user_id}")
+                                
+                                # Obtém o contact_id do contato atual
+                                contact_response = supabase.table('contacts').select('id').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+                                
+                                if not contact_response.data or len(contact_response.data) == 0:
+                                    logger.error(f"Contato não encontrado para agendamento: {phone}")
+                                    raise Exception("Contato não encontrado")
+                                
+                                contact_id = contact_response.data[0]['id']
+                                logger.info(f"DEBUG - Contact ID para agendamento: {contact_id}")
+                                
+                                # Formatar data e hora para o formato ISO
+                                start_datetime = f"{appointment_date}T{appointment_time}:00"
+                                end_datetime = f"{appointment_date}T{end_time}:00" if end_time else None
+                                
+                                # Insere o agendamento no banco de dados com as colunas corretas
+                                appointment_data = {
+                                    'title': title,
+                                    'description': description or f"Agendamento para {customer_name}",
+                                    'start_time': start_datetime,
+                                    'end_time': end_datetime,
+                                    'status': status,
+                                    'location': location,
+                                    'contact_id': contact_id,
+                                    'user_id': user_id,  # Adiciona o user_id
+                                    'created_at': datetime.utcnow().isoformat(),
+                                    'updated_at': datetime.utcnow().isoformat()
+                                }
+                                
+                                # Adiciona notas ao description se existirem
+                                if notes:
+                                    appointment_data['description'] += f"\nObservações: {notes}"
+                                    
+                                # Adiciona serviço ao description se existir
+                                if service_type:
+                                    appointment_data['description'] += f"\nServiço: {service_type}"
+                                    
+                                # Adiciona dados do cliente ao description
+                                appointment_data['description'] += f"\nCliente: {customer_name}"
+                                appointment_data['description'] += f"\nContato: {customer_contact or phone}"
+                                
+                                # Realiza a inserção no banco
+                                response = supabase.table('calendar_events').insert(appointment_data).execute()
+                                
+                                success = True
+                                logger.info(f"Agendamento criado com sucesso para {phone}: {title} em {start_datetime}")
+                            except Exception as e:
+                                logger.error(f"Erro ao criar agendamento: {str(e)}")
+                                success = False
+                            
+                            # Retorna o resultado
+                            tool_outputs.append({
+                                "tool_call_id": tool_call.id,
+                                "output": json.dumps({
+                                    "success": success,
+                                    "message": "Agendamento criado com sucesso" if success else "Falha ao criar agendamento"
+                                })
+                            })
+                            
+                            logger.info(f"Função agendamento processada para {phone}")
                             
                         else:
                             # Para qualquer outra função, envia para o webhook
@@ -1114,38 +1289,68 @@ async def process_delayed_message(phone: str, agent_id: str, token: str, quepasa
             del pending_tasks[key]
 
 @app.post("/webhook")
-async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias="x-quepasa-wid")):
+async def webhook(request: Request, x_quepasa_wid: str = Header(None, alias="x-quepasa-wid")):
     try:
-        # Extrai informações do corpo da mensagem
-        message = data.body
+        # Lê o corpo da requisição
+        body = await request.json()
+        
+        # Verifica se o corpo está dentro de um objeto 'body'
+        if 'body' in body:
+            message_data = body['body']
+        else:
+            message_data = body
+            
+        # Cria o objeto QuepasaMessage
+        message = QuepasaMessage(
+            id=message_data['id'],
+            timestamp=message_data['timestamp'],
+            type=message_data['type'],
+            chat=ChatInfo(
+                id=message_data['chat']['id'],
+                title=message_data['chat'].get('title')
+            ),
+            text=message_data.get('text'),
+            fromme=str(message_data.get('fromme', 'false')).lower() == 'true',
+            frominternal=str(message_data.get('frominternal', 'false')).lower() == 'true'
+        )
+        
+        # Log detalhado da requisição recebida
+        logger.info("=== NOVA REQUISIÇÃO WEBHOOK ===")
+        logger.info(f"Headers recebidos: x-quepasa-wid={x_quepasa_wid}")
+        logger.info(f"Corpo processado: {message.model_dump_json()}")
+        
+        # Extrai informações da mensagem
         message_id = message.id
         message_type = message.type
+        
+        logger.info(f"Tipo de mensagem: {message_type}")
+        logger.info(f"ID da mensagem: {message_id}")
         
         # Extrai número do telefone e nome do chat
         phone = message.chat.id.split('@')[0]
         push_name = message.chat.title or f"User {phone}"
         
-        # Trata o campo fromme que pode vir como string "false" ou "true"
-        if isinstance(message.fromme, str):
-            from_me = message.fromme.lower() == "true"
-        else:
-            from_me = bool(message.fromme)
-            
-        logger.info(f"From me original: {message.fromme}, convertido: {from_me}")
+        logger.info(f"Número do telefone: {phone}")
+        logger.info(f"Nome do chat: {push_name}")
         
-        # O cabeçalho vem como "x-quepasa-wid" mas usamos quepasa_wid no banco de dados
-        quepasa_wid = x_quepasa_wid
-        logger.info(f"Cabeçalho x-quepasa-wid recebido: {quepasa_wid}")
+        # Trata o campo fromme
+        from_me = message.fromme
+        logger.info(f"From me: {from_me}")
         
-        if not quepasa_wid:
+        # Limpa o número de telefone removendo tudo após os dois pontos
+        if ':' in x_quepasa_wid:
+            x_quepasa_wid = x_quepasa_wid.split(':')[0]
+            logger.info(f"Número de telefone limpo para busca: {x_quepasa_wid}")
+        
+        if not x_quepasa_wid:
             logger.error("Cabeçalho x-quepasa-wid não encontrado na requisição")
             return {"success": False, "message": "Header x-quepasa-wid ausente"}
         
-        # Busca o assistente pelo assistant_id em vez de x-quepasa-wid
-        response = supabase.table('assistants').select('id, token, assistant_id').eq('assistant_id', quepasa_wid).execute()
-        
+        # Busca o assistente pelo x-quepasa-wid primeiro
+        response = supabase.table('assistants').select('id, token, assistant_id').eq('x-quepasa-wid', x_quepasa_wid).execute()
+
         if not response.data or len(response.data) == 0:
-            logger.error(f"Nenhum assistente encontrado para assistant_id: {quepasa_wid}")
+            logger.error(f"Nenhum assistente encontrado para x-quepasa-wid: {x_quepasa_wid}")
             # Tenta buscar todos os assistentes para debug
             all_assistants = supabase.table('assistants').select('id, token, assistant_id').execute()
             logger.info(f"Assistentes disponíveis: {len(all_assistants.data) if all_assistants.data else 0}")
@@ -1153,25 +1358,25 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
             if all_assistants.data:
                 logger.info(f"Colunas disponíveis: {list(all_assistants.data[0].keys())}")
                 
-                # Verificar se existe um assistente para este assistant_id
+                # Verificar se existe um assistente para este x-quepasa-wid
                 try:
-                    resp_alt = supabase.table('assistants').select('id, token, assistant_id').eq('assistant_id', quepasa_wid).execute()
+                    resp_alt = supabase.table('assistants').select('id, token, assistant_id').eq('x-quepasa-wid', x_quepasa_wid).execute()
                     if resp_alt.data and len(resp_alt.data) > 0:
-                        logger.info(f"Assistente encontrado usando coluna 'assistant_id': {resp_alt.data[0]['id']}")
+                        logger.info(f"Assistente encontrado usando coluna 'x-quepasa-wid': {resp_alt.data[0]['id']}")
                         response = resp_alt
                     else:
-                        logger.error(f"Assistente não encontrado com 'assistant_id' também")
+                        logger.error(f"Assistente não encontrado com 'x-quepasa-wid' também")
                 except Exception as e:
-                    logger.error(f"Erro ao buscar com assistant_id: {str(e)}")
+                    logger.error(f"Erro ao buscar com x-quepasa-wid: {str(e)}")
             
             if not response.data or len(response.data) == 0:
                 return {"success": False, "message": "Assistente não configurado para este número"}
-        
+
         agent_data = response.data[0]
         agent_id = agent_data['id']
-        token = agent_data['token']
-        openai_assistant_id = agent_data.get('assistant_id')  # ID do assistente na OpenAI - coluna correta
-        
+        token = agent_data['assistant_id']  # Usa o assistant_id como token
+        openai_assistant_id = agent_data.get('assistant_id')  # ID do assistente na OpenAI
+
         if not openai_assistant_id:
             logger.error(f"ID do assistente na OpenAI não encontrado para o agente {agent_id}")
             return {"success": False, "message": "Assistente não configurado corretamente (falta ID OpenAI)"}
@@ -1184,7 +1389,7 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
         log_with_instance(f"De mim: {from_me}", agent_id)
 
         # Primeiro, verifica o status atual do contato
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', x_quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
@@ -1206,7 +1411,7 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
                     'status': 'cooldown',
                     'cooldown_until': cooldown_end,
                     'from_me': True
-                }).eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+                }).eq('whatsapp', phone).eq('x-quepasa-wid', x_quepasa_wid).execute()
                 
                 log_with_instance(f"Contato {phone} colocado em cooldown por 24 horas", agent_id)
                 return {"success": True, "message": "Contato em cooldown após mensagem do sistema/dono"}
@@ -1220,7 +1425,7 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
             # Continua o processamento normal para mensagens do cliente
 
         # Verifica novamente o status após qualquer atualização
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', x_quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
@@ -1255,7 +1460,7 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
             return {"status": "error", "message": "Contact limit exceeded"}
 
         # Verifica o status uma última vez antes de processar a mensagem
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', x_quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
@@ -1302,7 +1507,7 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
             return {"success": False, "message": "Mensagem vazia"}
 
         # Verifica o status uma última vez antes de adicionar à fila
-        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', quepasa_wid).execute()
+        contact_response = supabase.table('contacts').select('*').eq('whatsapp', phone).eq('x-quepasa-wid', x_quepasa_wid).execute()
         contact = contact_response.data[0] if contact_response.data else None
         current_status = contact['status'] if contact else None
         
@@ -1329,8 +1534,9 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
                 phone=phone, 
                 agent_id=agent_id, 
                 token=token, 
-                quepasa_wid=quepasa_wid,
-                openai_assistant_id=openai_assistant_id
+                quepasa_wid=x_quepasa_wid,
+                openai_assistant_id=openai_assistant_id,
+                chat_title=message.chat.title
             )
         )
         pending_tasks[key] = task
@@ -1341,8 +1547,8 @@ async def webhook(data: QuepasaWebhook, x_quepasa_wid: str = Header(None, alias=
     except Exception as e:
         # Tenta identificar o agent_id para log, caso não tenha sido definido ainda
         agent_id = "unknown"
-        if hasattr(data, 'body') and hasattr(data.body, 'chat'):
-            phone = data.body.chat.id.split('@')[0]
+        if hasattr(message_data, 'chat') and hasattr(message_data.chat, 'id'):
+            phone = message_data.chat.id.split('@')[0]
             logger.error(f"Erro no processamento para {phone}: {str(e)}")
         
         log_with_instance(f"Erro no processamento: {str(e)}", agent_id, "ERROR")
@@ -1482,6 +1688,18 @@ async def process_quepasa_image(message_id: str, token: str) -> str:
     except Exception as e:
         logger.error(f"Erro ao processar imagem: {str(e)}")
         return "[Não foi possível analisar a imagem]"
+
+# Adiciona endpoint de teste
+@app.get("/test")
+async def test_endpoint():
+    logger.info("Endpoint de teste acessado")
+    return {"status": "ok", "message": "Servidor está funcionando"}
+
+# Adiciona logs de inicialização
+logger.info("=== INICIALIZANDO SERVIDOR ===")
+logger.info(f"URL da API Quepasa: {QUEPASA_API_URL}")
+logger.info(f"URL do servidor: http://0.0.0.0:3004")
+logger.info("=== SERVIDOR INICIALIZADO ===")
 
 if __name__ == "__main__":
     import uvicorn
