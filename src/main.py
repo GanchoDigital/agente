@@ -513,9 +513,16 @@ async def send_quepasa_message(phone: str, data: dict, token: str) -> bool:
             "X-QUEPASA-TOKEN": token
         }
         
+        # Ensure QUEPASA_API_URL has a protocol
+        api_url = QUEPASA_API_URL
+        if not api_url.startswith(("http://", "https://")):
+            # Default to https if no protocol is found
+            api_url = f"https://{api_url}"
+            logger.warning(f"QUEPASA_API_URL was missing protocol. Prepended 'https://'. New URL: {api_url}")
+
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{QUEPASA_API_URL}/send",
+                f"{api_url}/send",  # Use the potentially modified api_url
                 headers=headers,
                 json=payload,
                 timeout=30
@@ -1597,9 +1604,16 @@ async def download_quepasa_media(message_id: str, token: str) -> Optional[bytes]
             "X-QUEPASA-TOKEN": token
         }
         
+        # Ensure QUEPASA_API_URL has a protocol
+        api_url = QUEPASA_API_URL
+        if not api_url.startswith(("http://", "https://")):
+            # Default to https if no protocol is found
+            api_url = f"https://{api_url}"
+            logger.warning(f"QUEPASA_API_URL in download_quepasa_media was missing protocol. Prepended 'https://'. New URL: {api_url}")
+
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{QUEPASA_API_URL}/download/{message_id}?cache=false",
+                f"{api_url}/download/{message_id}?cache=false", # Use the potentially modified api_url
                 headers=headers,
                 timeout=30
             )

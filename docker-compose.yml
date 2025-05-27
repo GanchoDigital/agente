@@ -11,6 +11,7 @@ services:
       - OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
       - EVOLUTION_API_URL=https://evo.ganchodigital.com.br
       - EVOLUTION_API_KEY=your-api-key
+      - QUEPASA_API_URL=https://qp.askgeni.us
       - SUPABASE_URL=https://gonabnfgeknhswxecryb.supabase.co
       - SUPABASE_KEY=your-supabase-key
     volumes:

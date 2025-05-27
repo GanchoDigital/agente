@@ -8,4 +8,5 @@ pydantic==2.10.6
 python-multipart==0.0.9
 typing-extensions==4.12.2
 aiohttp==3.11.14
-aiohappyeyeballs==2.6.1 
+aiohappyeyeballs==2.6.1
+pytz 
